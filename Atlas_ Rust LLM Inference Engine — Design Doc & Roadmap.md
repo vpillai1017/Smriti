@@ -1,179 +1,266 @@
-# Atlas: A Rust LLM Inference Engine (Design Doc + Roadmap)
+# Atlas: A Focused Rust LLM Serving Experiment (Design Doc + Roadmap)
 
-*Codename "Atlas" is a placeholder. Version 0.1, October 2026. Ecosystem facts (versions, who supports what) move fast, so verify anything marked ⚠️ before committing to it.*
+*Codename “Atlas” is a placeholder. Version 0.3, October 2026. Open-source experiment; scope is one NVIDIA GPU, with CPU used only for host-side development and small reference checks. This version incorporates the v0.3 principal review; Appendix B lists every change from v0.2.*
+
+**Status: proposal, not a performance claim. No Atlas measurements are presented here.** Baseline gaps, library integration feasibility and supported feature combinations must be verified before implementation commitments. Ecosystem facts move fast; verify anything marked ⚠️.
 
 ---
 
 ## 0. TL;DR
 
-**Goal:** minimize **$ per million tokens** at a given latency SLO, on NVIDIA GPUs first, with a clean path to TPUs.
+**What this is:** an open-source experiment to build a focused Rust LLM serving engine and test one thesis: **reuse-aware KV residency and scheduling can raise successful multi-turn serving goodput at fixed latency, quality and resources, compared with tuned vLLM and SGLang.**
 
-**Core thesis:**
+**What it is not:** a general-purpose inference platform, a claim that Rust makes inference faster, or an attempt to match vLLM’s breadth.
 
-1. Serving cost is mostly a function of **GPU utilization × memory efficiency × work avoided** (prefix reuse, speculation, quantization). It is not raw kernel speed alone.
-2. vLLM, SGLang and TensorRT-LLM each solved a different slice. A new engine should combine:
-   - vLLM's paged KV and continuous batching,
-   - SGLang's radix prefix reuse, zero-overhead CPU scheduling and cache-aware routing,
-   - TensorRT-LLM's kernel quality, ahead-of-time warmup discipline and quantization depth,
-   - Mooncake / Dynamo-style disaggregation and tiered KV.
-3. Rust's real advantages here are **no GIL, a deterministic CPU control plane, fearless concurrency, a single static binary, and a simulatable scheduler**. They are not "faster kernels". Kernels stay CUDA/Pallas/Triton; Rust owns everything around them.
-4. **The hardware abstraction boundary is the single most important design decision.** Don't abstract at "tensor op" level (that's building a compiler). Abstract at **"execute this ragged batch step against this paged KV cache"**, with a **macro-op model IR** (about 25 fused ops) that GPU backends interpret and TPU backends lower to StableHLO.
-5. **Build a second backend early** (a CPU reference backend in month 1, a TPU spike by month 3–4) so the abstraction is validated before it calcifies.
+**Initial scope:**
 
-**Recommended wedge (what makes this worth building vs. contributing to vLLM/SGLang):**
+- One exact dense model (Llama-3.1-8B-Instruct, BF16 weights and KV) on one recorded H100 80 GB configuration; single process, single GPU.
 
-- a hardware-portable core with a Rust control plane;
-- cost-aware scheduling and cluster routing built in from day one (per-request GPU-second accounting);
-- tiered KV cache (HBM → host → NVMe/remote) as a first-class feature, not a bolt-on;
-- a deterministic **scheduler simulator** that lets you iterate on policy without GPUs.
+- Continuous batching, chunked prefill and paged KV as prerequisites, not differentiators.
 
----
+- Prefix reuse and a bounded host-DRAM KV tier, only if baseline measurements justify them.
 
-## 1. Problem Framing: Where Does Serving Cost Come From?
+- CPU for host-side development and small reference checks; not a serving backend.
 
-```
-$ / Mtok  =  (GPU $/hr) / (tokens/sec/GPU × 3600) × 1e6
-```
+- Everything else (MoE, tensor parallelism, quantization, router, disaggregation, other accelerators, ...) is deferred and evidence-gated (§1.5, §8).
 
-To lower it, raise tokens/sec/GPU **at fixed SLO** (TTFT, TPOT/ITL, P99), or move to cheaper hardware. The levers:
+**Success target (provisional; frozen after baselines):** ≥ 1.30× sustainable request goodput on the primary workload versus the best tuned baseline, with no quality regression and within the guardrails in §7.4. At unchanged infrastructure cost that is about **23.1% lower cost per successful request**. A 25% cost reduction would need ≥ 1.333× goodput or cheaper resources.
 
-| Lever | Mechanism | Who does it well today |
-| --- | --- | --- |
-| **Batch size / utilization** | Continuous batching, chunked prefill, no CPU stalls | vLLM, SGLang, TRT-LLM |
-| **KV memory efficiency** | Paged blocks, KV quantization (FP8), MLA, sliding window | vLLM (paging), DeepSeek (MLA) |
-| **Work avoidance** | Prefix/radix caching, cache-aware routing, KV tiering | SGLang (radix), LMCache, Mooncake |
-| **Decode is memory-bound** | Speculative decoding (EAGLE/MTP/n-gram), quantized weights | all, to varying degrees |
-| **Prefill vs decode interference** | Chunked prefill; **P/D disaggregation** | Sarathi-Serve, DistServe, Mooncake, Dynamo, llm-d |
-| **Kernel efficiency** | Fused attention, FP8/FP4 GEMM, fused MoE, custom all-reduce | TRT-LLM, FlashInfer, DeepGEMM |
-| **CPU overhead** | Async scheduling, CUDA graphs, no Python on hot path | SGLang overlap scheduler, TRT-LLM C++ runtime |
-| **Cluster-level packing** | SLO-aware routing, autoscaling, multi-tenant LoRA | Dynamo, llm-d, Ray Serve |
+**How decisions are made:**
 
-**Key insight:** at small scale, kernels dominate. At fleet scale, **cache hit rate, batch fill, and P/D balance** dominate. Atlas should be designed so single-GPU performance is competitive *and* fleet-level levers are first-class.
+1. **Measure first.** Stage A characterizes the baselines and bounds the possible gain before any Atlas code exists.
+
+2. **Prototype where it’s cheapest.** If feasible, test the intervention inside an existing engine first (Stage B).
+
+3. **Build intent is a separate, recorded decision.** The goal includes an open-source Rust engine, which an upstream contribution alone doesn’t satisfy. Stage C may follow a positive upstream result if that intent is recorded (§12.8). Atlas is then compared against baselines that *include* any contributed policy.
+
+4. **Freeze the workload, SLOs, minimum effect and resource budget before evaluating the candidate.** Publish negative results too.
+
+**Engineering stance:**
+
+- Rust is the control-plane implementation language: explicit ownership, native concurrency, no GIL. It does not by itself guarantee deterministic execution, zero allocation, faster kernels or a static portable binary.
+
+- Existing CUDA libraries (cuBLASLt, FlashInfer) provide the data plane wherever practical.
+
+- No public backend trait, model IR or large crate graph is frozen before a real CUDA vertical slice works. Start with three crates and split on evidence (§6).
 
 ---
 
-## 2. What To Take From Each Existing Engine
+## 1. Problem Framing
+
+### 1.1 First-principles model
+
+For a kernel or a sufficiently homogeneous execution segment,  a useful lower bound is:
+
+$$
+
+T_{\text{segment}} \gtrsim \max\left(\frac{F}{P_{\text{eff}}},\ \frac{B_{\text{HBM}}}{BW_{\text{eff}}}\right) + T_{\text{unhidden overhead}}
+
+$$
+
+$F$ is executed FLOPs, $B$ is bytes moved, and effective compute and bandwidth are measured for the relevant shapes. A model step is a dependency graph of such segments, so one roofline maximum is not an exact step predictor. Transfers, collectives and host work matter only when they extend the critical path rather than overlap it.
+
+Request latency also includes tokenization, queueing, cache restoration, execution and output delivery. Near saturation, a small service-time change causes a large queueing change; measure both.
+
+Prefill often becomes compute-bound at sufficient token batch size. Low-batch decode often becomes weight-bandwidth-bound. Long context, larger batches and communication can move the bottleneck. Neither label is a universal scheduling rule.
+
+**Bound the improvement before building (Amdahl).** If a removable stall is fraction $f$ of the execution critical path, removing it gives at most $1/(1-f)$. A 2% stall permits about 1.02×; 1.30× needs about 23.1% removable time. This bounds execution speed, not tail latency under queueing, which needs a load sweep. It is also why “lower CPU overhead” alone cannot be the thesis.
+
+### 1.2 Cost
+
+$$
+
+\text{cost per M successful output tokens} = \frac{\text{total infrastructure cost during the window}}{\text{output tokens from successful, SLO-compliant requests}} \times 10^6
+
+$$
+
+Also report cost per successful request. Count GPU, CPU, RAM and any extra services; label GPU-only estimates as such. Cached input tokens are not newly generated output tokens. Shorter, truncated or invalid outputs never count as improvements.
+
+### 1.3 When KV restoration pays (illustrative; replaced by Stage A measurements)
+
+For conventional dense attention with uniform layers, uncompressed KV storage is about $2 \cdot L \cdot H_{kv} \cdot D_{head} \cdot b$ bytes per token. For Llama-3.1-8B (32 layers, 8 KV heads, head dimension 128, BF16) that is **128 KiB/token**, so a 16,384-token prefix is **2 GiB** before metadata.
+
+| Path | Illustrative cost for a 16K-token prefix |
+
+| --- | --- |
+
+| Restore from host at an assumed 25 GB/s effective | ≈ 86 ms of copy, which can partly overlap other compute |
+
+| Recompute | ≈ 2.6e14 FLOPs dense (2 × params × tokens) + ≈ 7.0e13 FLOPs causal attention ≈ 3.3e14 FLOPs → ≈ 0.6 s at an assumed 550 TFLOP/s effective, competing with other requests |
+
+| Capacity | ≈ 55 GB free HBM holds ≈ 25 such prefixes; 200 GB of host memory ≈ 93 |
+
+Restore only when expected avoided recomputation outweighs transfer, queueing and residency opportunity costs. Measure that threshold across context lengths, reuse distances and concurrent load. A higher cache hit rate is a diagnostic, not the success metric. MLA and hybrid-state models need different accounting.
+
+### 1.4 Hypotheses and experiments
+
+Each experiment states a baseline loss, an achievable upper bound, the intervention, confounders and the falsifying observation. Do not assume a baseline lacks a capability; check current versions.
+
+| ID | Hypothesis | Cheapest discriminating experiment | Drop or stop when |
+
+| --- | --- | --- | --- |
+
+| **H1: residency** (primary) | On the primary trace, avoidable re-prefill of reusable prefixes materially limits goodput after baseline offload is tuned. | Compare tuned vLLM and SGLang with their supported cache/offload configurations; record restored bytes, repeated prefill, reuse distance and queueing. Test a measured restore-versus-recompute policy. | An existing configuration closes the gap, restoration costs more than recomputation, or no material reusable working set exists. |
+
+| **H2: scheduling** (adjacent) | A fixed chunk/residency policy loses goodput across changing load because it misses latency and reuse trade-offs. | Replay a fixed time-varying load trace; compare an adaptive policy against both the best fixed configuration for that trace and load-specific tuned configurations. | Gains disappear against fair tuning, violate fairness, or are explained by different admission/output behavior. |
+
+| **H3: host overhead** (conditional) | Unhidden host work creates material GPU gaps in the selected operating regime. | Collect scheduler/output timings and GPU timelines; bound the gain with $1/(1-f)$, then test an overlap or native hot-path intervention. | The critical-path fraction is too small to justify the work, or the baseline already hides it. |
+
+H1 is the thesis. If H1 fails, stop; a different thesis needs a new review, not automatic scope expansion. Run one intervention at a time and reprofile after each improvement, because the bottleneck may move.
+
+v0.2’s “features don’t compose” and “static speculation configs” hypotheses are now follow-up composition experiments (§5.7), not part of the thesis.
+
+### 1.5 Scope and non-goals
+
+**Initial scope**
+
+- One exact checkpoint: **Meta-Llama-3.1-8B-Instruct, BF16 weights and KV**, subject to access and license approval. Record its revision and artifact hashes. If unavailable, choose and freeze a replacement before baseline runs.
+
+- One H100 80 GB configuration. Record PCIe or SXM variant, power limits, CPU, RAM, topology, driver and CUDA versions. Never mix results from different configurations.
+
+- Single process, single GPU, streaming Chat Completions for the subset the workload needs.
+
+- Continuous batching, chunked prefill and paged KV as prerequisites.
+
+- Prefix reuse and a bounded host-DRAM KV tier only if Stage A justifies them.
+
+- Tenant-scoped caching; basic admission, cancellation, backpressure and health.
+
+**Deferred** (each needs user demand, hardware access, a measured bottleneck and a separate scope decision): MoE, MLA, hybrid-state models, tensor/expert/pipeline parallelism, router, prefill/decode disaggregation, LoRA, multimodal, quantization, learned draft models, a general graph compiler, CPU serving, and TPU/AMD/other backends.
+
+**Follow-up composition tests, not prerequisites:** structured output and prompt-lookup speculation. The primary trace initially replays fixed tool results without grammar enforcement, so no constrained-output performance can be claimed from it.
+
+---
+
+## 2. What To Take From Existing Engines
 
 ### 2.1 Lessons table
 
 |  | **vLLM** | **SGLang** | **TensorRT-LLM** |
+
 | --- | --- | --- | --- |
-| **Best idea** | PagedAttention + continuous batching; hybrid KV cache groups; huge model/hardware coverage | RadixAttention prefix tree; overlap ("zero-overhead") scheduler; cache-aware router; strong MoE/EP and DeepSeek serving; grammar-constrained decoding | Kernel quality (fused MHA/XQA, FP8/FP4, custom AllReduce); AOT warmup and CUDA graph discipline; deep quantization recipes |
-| **Steal** | Block manager design, ref-counted blocks, token-budget scheduler, V1-style separated engine core | Async scheduling with "future tokens", radix tree for eviction *and* routing, structured-output pipeline | Plan-then-run execution, bucketed graphs, quantization format handling, in-flight batching semantics |
-| **Avoid** | Python/GIL on the control path, large combinatorial feature matrix, scheduler complexity creep | Python scheduler overhead (mitigated but present), feature sprawl | Heavy engine-build step and lock-in to one vendor stack, hard-to-extend runtime |
-| **Weakness to beat** | CPU overhead at high QPS/small models; config explosion | Operational polish; less hardware-agnostic | NVIDIA-only; flexibility |
 
-### 2.2 Other prior art worth studying
+| **Best idea** | PagedAttention + continuous batching; separated engine core; broad model/hardware coverage | RadixAttention prefix reuse; overlap scheduler; HiCache tiering; structured-output pipeline | Kernel quality; AOT warmup and CUDA graph discipline |
 
-- **FlashInfer**: attention kernel library with a *plan/run* API, load-balanced scheduling for ragged batches, cascade (shared-prefix) attention. Reuse it, don't rewrite it. ⚠️ Check current license/versions.
-- **Sarathi-Serve**: stall-free chunked prefill. The scheduling model behind unified prefill+decode batches.
-- **DistServe / Splitwise / Mooncake**: prefill/decode disaggregation and KV-centric architecture.
-- **NVIDIA Dynamo / NIXL, llm-d, LMCache**: orchestration, KV transfer abstraction, KV offload. ⚠️ These evolve quickly.
-- **xgrammar, llguidance**: grammar-constrained decoding. **llguidance is written in Rust**, so it can be used directly.
-- **S-LoRA / Punica**: batched multi-adapter serving.
-- **Rust-side prior art:** mistral.rs, candle, Hugging Face TGI (Rust router), Dynamo's Rust components. Study what they do, and be clear about how Atlas differs.
-- **TPU-side prior art:** JAX + Pallas ragged paged attention, MaxText/JetStream, vLLM's TPU backend, SGLang-JAX. ⚠️ Verify current state.
+| **Adopt in Atlas** | Ref-counted blocks, token-budget scheduler, chunked prefill | Prefix reuse semantics; overlap later, under the §5.7 contract | Plan-then-run execution; bounded graph buckets; warmup before serving |
+
+| **Measure in Stage A (don’t assume a gap)** | Prefix caching and KV offload behavior on multi-turn traces; remaining host gaps in the current version | HiCache residency behavior; remaining host gaps with overlap on | Optional extra baseline; not evidence of an automatic kernel advantage |
+
+All three already use native code, overlap techniques and prefix caching in some form. Compare traces, not language labels or feature lists.
+
+### 2.2 Prior art
+
+- **FlashInfer:** paged/ragged attention with a plan/run API. Evaluate it for Atlas; calling it from Rust is not a trivial cubin-linking task (§5.6). ⚠️ Check license, API and packaging.
+
+- **Sarathi-Serve:** stall-free chunked prefill; the model for unified prefill/decode batches.
+
+- **LMCache, SGLang HiCache:** KV offload and tiering; the H1 baselines. ⚠️ Fast-moving.
+
+- **mistral.rs, candle:** study before choosing the Rust/CUDA integration.
+
+- **llguidance, xgrammar:** evaluate only when structured output enters scope.
+
+- **Future references, not a feature list:** DistServe, Splitwise, Mooncake, Dynamo/NIXL, llm-d, TensorRT-LLM, speculative-decoding literature, S-LoRA/Punica, JAX/Pallas.
 
 ---
 
 ## 3. Design Principles
 
-1. **Control plane in Rust, data plane in kernels.** Rust never touches per-token math on the hot path; it orchestrates.
-2. **Ragged-first.** Every step is a flat batch of tokens with `cu_seqlens`. No separate "prefill path" and "decode path" at the IR level. Chunked prefill, decode, speculative verification, and mixed batches are all the same shape of thing.
-3. **Overlap everything.** While the device runs step *N*, the CPU plans step *N+1*, runs tokenizer/detokenizer work, and computes grammar masks.
-4. **No allocation in the hot path.** Arena allocators for device workspace, pinned host buffers reused across steps, preplanned memory.
-5. **Static where possible, dynamic where necessary.** Bucketed shapes + CUDA graphs on GPU; static shape buckets + AOT-compiled executables on TPU. Same abstraction: `ShapeBucket`.
-6. **Capabilities, not `if backend == X`.** The core asks the backend what it supports (page sizes, quantization formats, spec-decode support) and adapts.
-7. **Everything is simulatable.** The scheduler + KV manager run against a mock backend with a latency model. This is both a test strategy and a product feature (capacity planning).
-8. **Cost is a first-class metric.** Every request carries GPU-time attribution. Benchmarks report $/Mtok under SLO, not just tokens/sec.
-9. **Don't write kernels you can borrow.** Reuse FlashInfer / CUTLASS / DeepGEMM / NCCL at first; replace only where profiling proves a gap.
-10. **Python-free serving path.** Python is allowed at *build time* (kernel authoring, TPU graph export), never in the request path.
+1. **Measure before building.** Every component traces to the thesis (§1.4) or a prerequisite (§1.5).
+
+2. **Control plane in Rust, data plane in libraries and kernels.** Rust orchestrates; it does not do per-token math.
+
+3. **Ragged-first batches.** One step format covers prefill chunks and decode.
+
+4. **Start serial, overlap when measured.** Begin with submit, poll, reconcile. Overlap only when traces show material host gaps, and only under the §5.7 contract.
+
+5. **Preallocate what matters.** Steady-state device workspace and reusable metadata buffers are preallocated; scheduler and executor allocations are measured. No blanket zero-allocation rule for frontend or parser code.
+
+6. **Validate combinations, not feature lists.** Capabilities describe supported (model, attention layout, dtype, execution mode) combinations. Unsupported configurations fail at startup.
+
+7. **Correctness contracts before performance features.** KV invariants (§5.3) and resource lifetimes are specified and tested before overlap or tiering.
+
+8. **Cost per successful request** is the metric (§1.2), not raw tokens/sec.
+
+9. **Borrow kernels.** Write small ones only when integration or profiling requires it.
+
+10. **Python-free serving path.** Python is allowed at build and test time, never in the request path.
+
+11. **Explicit composition.** Each implemented feature combination has a correctness contract and a test. Unimplemented combinations are rejected, not silently degraded.
+
+12. **Tenant-scoped by default.** Namespaces prevent cross-tenant prefix reuse; they do not remove every timing channel (§5.3).
+
+13. **Don’t freeze APIs early.** Backend traits, model IRs and crate splits follow a working vertical slice, not precede it.
 
 ---
 
 ## 4. System Architecture
 
-### 4.1 Layered view
+### 4.1 Minimal architecture (initial milestone)
 
 ```mermaid
-flowchart TB
-    subgraph Edge["Frontend (tokio + axum/tonic)"]
-        API["OpenAI-compatible API\nSSE streaming, gRPC"]
-        TOK["Tokenizer + chat template\n(HF tokenizers, minijinja)"]
-        PARSE["Tool-call / reasoning parsers"]
-    end
 
-    subgraph Core["Engine Core (dedicated threads)"]
-        ADM["Admission + request state machine"]
-        SCH["Scheduler\n(token budget, policies, preemption)"]
-        KVM["KV Cache Manager\n(blocks, radix index, tiers)"]
-        GR["Grammar / logit-mask workers"]
-        SPEC["Speculation controller"]
-    end
+flowchart LR
 
-    subgraph HAL["Hardware Abstraction (Backend trait)"]
-        PLAN["StepPlan: ragged batch + block tables"]
-    end
+    API[”HTTP + streaming frontend\n(tokenize, template, detok, stop buffer)”] --> E[”Engine owner\nadmission, scheduler, KV metadata”]
 
-    subgraph GPU["CUDA backend"]
-        G1["Model executor\n(macro-op interpreter)"]
-        G2["Kernels: FlashInfer, CUTLASS,\nDeepGEMM, custom, Triton AOT"]
-        G3["NCCL / custom allreduce / NVSHMEM"]
-    end
+    E --> D[”CUDA executor\nbuffers, kernels, events”]
 
-    subgraph TPU["TPU backend"]
-        T1["PJRT executables\n(StableHLO)"]
-        T2["Pallas kernels:\nragged paged attention"]
-        T3["XLA collectives over ICI"]
-    end
+    D --> E
 
-    subgraph Cluster["Cluster plane (separate binary)"]
-        RT["Router: cache-aware, SLO-aware"]
-        XFER["KV transfer service\n(NVLink / RDMA / DCN)"]
-        AS["Autoscaler hooks"]
-    end
+    E --> OUT[”Bounded output delivery”]
 
-    API --> TOK --> ADM --> SCH
-    SCH <--> KVM
-    SCH --> GR
-    SCH --> SPEC
-    SCH --> PLAN
-    PLAN --> G1 --> G2
-    G1 --> G3
-    PLAN --> T1 --> T2
-    T1 --> T3
-    RT --> API
-    KVM <--> XFER
+    E --> HOST[”Optional bounded host KV tier\n(only if H1 survives)”]
+
 ```
 
-### 4.2 Threading and process model
+Not drawn, because not approved: overlapped execution, grammar workers, speculation, router, KV transfer, multi-GPU. Each is added to this diagram only when its scope decision passes (§8).
 
-Rust's lack of a GIL lets you simplify what vLLM had to split across processes:
+### 4.2 Ownership, threads and process model
 
-- **One process per node by default.** Threads:
-  - `tokio` runtime for I/O (HTTP, SSE, gRPC);
-  - **engine thread** (scheduler + KV manager; single-writer, no locks on hot structures);
-  - **one device-driver thread per accelerator** (submits steps, owns the device context);
-  - a small **CPU worker pool** for tokenization, detokenization, grammar mask computation, and chat template rendering.
-- Communication via bounded lock-free channels (`crossbeam` / `flume`). Message passing is preferred over shared state.
-- **Optional process-per-device mode** for fault isolation (CUDA errors can poison a context). Same code, different spawn strategy.
-- Multi-node: one engine core per replica; TP/EP across nodes handled by backend collectives, coordinated by a leader.
+- One process, one GPU.
+
+- A `tokio` runtime for HTTP and SSE.
+
+- **One engine thread** owns request state, scheduling and logical KV metadata (single writer).
+
+- **One executor** owns device allocations, streams and submissions.
+
+- Tokenization, detokenization and output delivery run off the scheduling critical path.
+
+- Bounded channels on every edge. No custom lock-free structures are required.
+
+- A context-poisoning CUDA error restarts the serving process (§5.10). Process-per-device isolation is a later option, not an initial feature.
 
 ### 4.3 Request lifecycle
 
 ```mermaid
+
 stateDiagram-v2
+
     [*] --> Queued: admitted
+
     Queued --> Prefilling: scheduled (chunk 1..k)
+
     Prefilling --> Decoding: prompt fully computed
-    Decoding --> Decoding: step (1 or k+1 tokens with spec)
+
+    Decoding --> Decoding: step
+
     Decoding --> Preempted: KV pressure
-    Preempted --> Queued: recompute or swap-in
+
+    Preempted --> Queued: recompute (or restore once the host tier exists)
+
     Decoding --> Finished: EOS / stop / max_tokens
+
     Prefilling --> Finished: cancel
+
     Decoding --> Finished: cancel
+
     Finished --> [*]
+
 ```
+
+`Finished` releases logical ownership immediately. Device resources are released only after every in-flight step that references them completes (§5.3, invariant 2).
 
 ---
 
@@ -181,549 +268,1194 @@ stateDiagram-v2
 
 ### 5.1 Frontend
 
-- **Crates:** `axum` + `tokio` (HTTP/SSE), `tonic` (gRPC), HF `tokenizers` (Rust-native), `minijinja` (chat templates).
-- **API surface:** OpenAI Chat Completions + Completions first, then Responses API, embeddings, and an internal gRPC for the router.
-- **Tool-call and reasoning parsers** are per-model plugins (Hermes-style, Llama, Qwen, DeepSeek, etc.), operating on the detokenized stream.
-- **Incremental detokenization** runs on the CPU pool, off the engine thread.
-- **Backpressure:** bounded queue per tenant. Reject early (429) rather than buffering unboundedly.
+- **Libraries:** `axum` + `tokio` (HTTP/SSE), HF `tokenizers`, `minijinja` for chat templates. Verify exact template parity with the reference before trusting any benchmark.
 
-### 5.2 Engine core and scheduler
+- **API surface:** the streaming Chat Completions subset the primary workload needs. Completions, Responses, embeddings and gRPC come later.
 
-**Scheduling model:** token-budget, unified prefill/decode, in the style of Sarathi-Serve and vLLM V1. Each step has a budget (`max_num_batched_tokens`, `max_num_seqs`). The scheduler fills it in priority order:
+- **Tool calls:** only what the primary trace needs. Per-model parser plugins come later.
 
-1. running decodes (1 token each, or `1 + k` with speculation),
-2. in-progress chunked prefills,
-3. new requests (admitted only if KV blocks are available).
+- **Incremental detokenization** runs off the engine thread.
 
-**Pluggable policy trait:**
+- **Stop strings:** a pending-output buffer holds back any text that could still begin a stop sequence. Already-delivered output can’t be trimmed, so nothing is streamed until the stop check clears it. Test UTF-8 boundaries, disconnects and slow clients.
 
-```rust
-pub trait SchedulePolicy: Send {
-    /// Order candidates; may veto admission.
-    fn rank(&self, ctx: &SchedCtx, cands: &mut [CandidateRef]);
-    /// Choose preemption victim(s) under KV pressure.
-    fn pick_victims(&self, ctx: &SchedCtx, need_blocks: usize) -> Vec<SeqId>;
-    /// Optional chunk-size hint (e.g. shrink prefill chunks when TPOT SLO at risk).
-    fn chunk_size(&self, ctx: &SchedCtx, seq: &SeqState) -> usize;
-}
-```
+- **Bounds:** request size, queued work, generated length, host memory and output buffers are all bounded. Reject early with 429. Output delivery never stalls the engine: slow clients are disconnected, without freeing in-flight resources early.
 
-Ship these policies:
+### 5.2 Engine and scheduler
 
-- `Fcfs`
-- `Priority` (tenant tiers)
-- `CacheAware` (prefer requests with high prefix-hit, SGLang-inspired)
-- `SloAware` (EDF-style on TTFT/TPOT deadlines, with chunk-size throttling)
+**Scheduling model:** token budget with unified prefill and decode, in the style of Sarathi-Serve and vLLM V1. Each step fills its budget in order: running decodes, then in-progress chunked prefills, then new admissions that fit the KV budget.
 
-**Async / overlapped scheduling (critical for utilization):**
+**Execution boundary** (conceptual, not frozen; §5.4): *submit a batch, poll completion, reconcile the result.* The initial loop is serial: one step in flight (Appendix A).
 
-The classic problem: step *N+1*'s inputs depend on the tokens sampled in step *N*, so a naive loop idles the GPU while the CPU plans. The solution (SGLang-style "future tokens"):
+**Policy:** start with FCFS and a fixed chunk size. Add a private policy trait only when a second policy exists; the adaptive policy is H2 and evidence-gated.
 
-1. Scheduler plans step *N+1* assuming each running sequence gets exactly one new token, referenced by a *placeholder* (`FutureToken { step: N, row: i }`).
-2. The device resolves placeholders **on-device** by gathering from step *N*'s sampled-output buffer when step *N+1* launches.
-3. When step *N* results arrive on the host, the scheduler **reconciles**: sequences that hit EOS/stop get their already-planned *N+1* slot discarded (one wasted token of compute is acceptable).
-4. Stop-string detection lags by one step; this is handled by trimming output at the frontend.
+**Preemption:** recompute first. Swap to the host tier only after the tier exists and the restore-versus-recompute table says it pays.
 
-Rust makes this much more tractable than in Python: the planning thread has real parallelism and pinned-buffer reuse is explicit.
+**Reconcile rules:**
 
-**Preemption:** two modes, chosen per policy: *recompute* (drop KV, re-prefill, usually cheaper with prefix cache) and *swap* (move blocks to host tier). Default is recompute-with-prefix-cache; with tiering enabled, prefer swap for long contexts.
+- Commit tokens and KV only for completed steps.
+
+- Publish prefix blocks only after their writes complete (invariant 1).
+
+- EOS and cancel release logical ownership at once; device resources are released only after in-flight work that references them completes (invariant 2).
 
 ### 5.3 KV cache manager
 
-This component is where most of the cost savings live, so it deserves the most care.
+This is where the thesis lives, so its correctness contract comes first.
 
-**Abstractions:**
+**Required invariants**
 
-- **`BlockPool`**: fixed-size physical blocks per *cache group*; free list; ref counts; O(1) alloc/free.
-- **`CacheGroup`**: supports **hybrid models** (full attention layers + sliding-window layers + Mamba/linear-attention state + MLA compressed KV). Each group has its own `CacheSpec { kind, page_size, bytes_per_token, window }`. vLLM's hybrid KV manager is the reference idea. Design for it from day one, because retrofitting is painful.
-- **`PrefixIndex`**: a **radix tree at block granularity** over token IDs (hash-chained block keys for O(1) lookup; tree structure for eviction ordering and for exporting to the router). Combines vLLM's hash-based block caching with SGLang's tree semantics.
-- **Eviction:** LRU on leaf blocks with ref-count 0, with pluggable policy (e.g. cost-aware: evict blocks that are cheap to recompute, keep blocks for long shared system prompts).
-- **Tiers:** `Hbm → HostDram → NvmeOrRemote`. Block moves are async copies on a dedicated stream/queue. The tier trait is the same one used for P/D KV transfer (see 5.9).
+1. **Reservation is not publication.** A planned KV write reserves capacity; only completed, validated writes can become reusable prefix entries.
+
+2. **Logical lifetime is not device lifetime.** Cancellation or EOS can end a request while later submitted work still references its blocks. Reuse requires all request, cache and in-flight references to be released and the relevant completion events to pass.
+
+3. **Reused IDs cannot alias old work.** References carry allocation generations (or equivalent protection against stale handles). Test cancellation followed by immediate reuse.
+
+4. **Committed length is authoritative.** Track committed tokens separately from reserved capacity and speculative writes. Rejected or unwritten slots are never visible as attention context.
+
+5. **Shared blocks are immutable.** Share only completed full blocks, or copy-on-write shared partial tails. Another request can never extend a cached prefix in place.
+
+6. **Capacity is bounded.** Admission and preemption stay within fixed device and host budgets, including metadata, graph/workspace buffers, transient transfers and a safety margin. Validate memory under the real mixed workload, not one maximum-shape forward pass.
+
+7. **Transfers have states.** Distinguish resident, copying, ready, failed and retiring blocks. Never expose a destination before the copy completes, or free a source the copy still needs.
+
+Tests must cover cancellation during copy, eviction during prefetch, stale tickets, partial prefix matches, transfer failure and cleanup after a device error. Use model-based tests against a naive implementation, plus GPU race and memory checks for executor lifetimes.
+
+**Cache identity and isolation**
+
+- Cache identity = tenant namespace + model/weight revision + effective positional/attention configuration + KV dtype/layout + token prefix. Adapters or multimodal inputs, if added later, join the key. Token IDs alone are not enough.
+
+- Sharing is tenant-scoped by default; cross-tenant sharing is opt-in.
+
+- A noncryptographic hash is an index, not proof of identity. Verify the full identity before reuse, or adopt an explicitly justified collision-safe design (for example a keyed cryptographic hash).
+
+- Retention and cleanup are bounded. Logs and diagnostic dumps never contain prompt text by default.
+
+- Namespaces prevent cross-tenant prefix reuse. They do not remove timing channels from shared scheduling, memory pressure or GPU resources. Hard isolation needs separate resources and is out of scope.
+
+**Residency policy**
+
+- Start with one page size, one full-attention cache group, an ordinary prefix index and LRU eviction. No hybrid cache groups, radix routing summaries or hash-chain machinery until needed.
+
+- Measure reusable tokens and bytes, not just request-level hits.
+
+- Add the host tier only after H1 survives Stage A. Bound pinned memory; measure NUMA placement and effective copy bandwidth under concurrent compute.
+
+- Restore complete required ranges before execution first. Add bounded prefetch only when traces show useful overlap; limit wasted prefetch and avoid eviction/restore cycles.
+
+- Restore-versus-recompute decisions start as a measured lookup table over context size and load. A simulator and detailed GPU-time attribution are not prerequisites.
+
+**Memory planning:** budget = device memory − weights − workspace − graph buffers − metadata − transient transfer buffers − safety margin. Plan once at startup, validate under the mixed workload, and never call `cudaMalloc` in the executor’s steady state.
+
+### 5.4 Execution boundary and capabilities
+
+One engine thread owns request state, scheduling and logical KV metadata. One executor owns device allocations and submissions. The boundary between them is conceptually **submit a batch, poll completion, reconcile the result**:
+
+- **Inputs:** token and position information, valid sequence lengths, logical page references and sampling parameters.
+
+- **Outputs:** sampled tokens, completion status and measured timings.
+
+Keep page references opaque and generation-tagged outside the executor. Host pinning, CUDA streams and graph capture are executor concerns. The boundary is a *private* trait inside the `atlas` crate (a CUDA adapter and a test mock implement it), frozen as ADR 1 only after the vertical slice works (C-08).
+
+**Capabilities validate combinations, not independent lists.** Unsupported configurations fail at startup:
 
 ```rust
-pub struct BlockId(u32);
 
-pub trait KvTier: Send + Sync {
-    fn capacity_blocks(&self) -> usize;
-    fn write(&self, blocks: &[(BlockHash, BlockData)]) -> TransferHandle;
-    fn read(&self, hashes: &[BlockHash], dst: &mut [BlockSlot]) -> TransferHandle;
-    fn contains(&self, h: BlockHash) -> bool;
+// Illustrative: the executor accepts only configurations it has been tested with.
+
+struct SupportedConfig {
+
+    model: ModelRevision,       // exact checkpoint revision and hash
+
+    attention: AttentionLayout, // e.g. full attention, page size 16
+
+    kv_dtype: DType,            // BF16
+
+    mode: ExecutionMode,        // Eager | DecodeGraphs
+
 }
+
 ```
 
-**Memory planning (startup):**
+### 5.5 Model code and weights
 
-1. Load weights.
-2. Run a profiling forward pass at the max bucket to measure activation/workspace peak.
-3. `kv_bytes = total_mem × utilization − weights − activations − workspace − comms_buffers`.
-4. Carve `BlockPool`s per cache group proportionally to layer counts and per-token bytes.
+- Implement the selected dense architecture in ordinary Rust code that calls executor operations. No macro-op IR, no graph compiler, no `CustomOp` registry.
 
-Plan memory once, allocate arenas once, never `cudaMalloc` in steady state.
+- Extract a model representation only when a second architecture is approved and shows what is actually shared.
 
-**KV quantization:** FP8 KV from day \~60, with per-head or per-block scales stored beside blocks. The `CacheSpec` carries dtype and scale layout, and the attention backend declares which combos it supports.
+- Weights: `safetensors` via `mmap` → pinned staging → device, with artifact-hash verification and a load-time metric. No quantized formats in the initial milestone.
 
-### 5.4 The hardware abstraction (the part to get right)
+### 5.6 CUDA integration
 
-**What crosses the boundary** is a `StepPlan`, a flat ragged batch that is identical in meaning for GPU and TPU:
+Use cuBLASLt for BF16 GEMM and evaluate FlashInfer for paged attention. Reuse established norm, RoPE, activation and sampling implementations where licensing and ABI permit. Write small kernels only when integration or profiling requires them.
 
-```rust
-pub struct StepPlan {
-    pub step_id: u64,
-    pub bucket: ShapeBucket,            // padded token / seq / page counts
+**Prove the stack before committing to it:** a Rust-to-library attention call, its metadata preparation, and a captured decode step with changing inputs (C-05 to C-09). Verify AOT packaging, workspace requirements, current APIs and licenses. Reusing a library is not automatically a trivial cubin-linking task.
 
-    // Flat ragged token layout
-    pub token_src: TokenSource,         // Host(ids) | DeviceFuture(prev_step, rows) | Mixed
-    pub positions: PinnedSlice<u32>,
-    pub cu_q_lens: PinnedSlice<u32>,    // query lengths per sequence (1 for decode, k+1 for spec, chunk for prefill)
-    pub kv_lens: PinnedSlice<u32>,      // total context length per sequence
+| Need | Initial choice | Later, only if profiling justifies |
 
-    // Paged KV addressing, per cache group
-    pub block_tables: Vec<BlockTable>,  // [seq][max_blocks] per group
-    pub slot_mapping: PinnedSlice<i64>, // where to write new KV
-
-    // Per-sequence extras
-    pub sampling: SamplingBatch,        // temp/top-p/top-k/penalties, seeds
-    pub logit_mask: Option<BitmaskRef>, // grammar masks, computed async on CPU
-    pub lora: Option<LoraBatch>,
-    pub spec: Option<SpecVerifyInfo>,   // draft tokens + tree mask for verification
-
-    // Tier / transfer side-effects scheduled alongside this step
-    pub block_ops: Vec<BlockOp>,        // copy, swap-in/out, prefetch
-}
-
-pub trait Backend: Send + 'static {
-    fn capabilities(&self) -> BackendCaps;       // page sizes, dtypes, spec support, max buckets...
-    fn plan_memory(&self, m: &ModelSpec, cfg: &MemCfg) -> Result<MemoryPlan>;
-    fn load_model(&mut self, m: &ModelSpec, w: &dyn WeightSource) -> Result<()>;
-    fn init_kv(&mut self, plan: &KvPlan) -> Result<()>;
-    fn warmup(&mut self, buckets: &[ShapeBucket]) -> Result<()>;   // graph capture / AOT compile
-
-    fn submit(&mut self, plan: StepPlan) -> Result<StepTicket>;    // non-blocking
-    fn wait(&mut self, t: StepTicket) -> Result<StepOutput>;       // sampled tokens, logprobs, spec accept info
-
-    fn block_op(&mut self, ops: &[BlockOp]) -> Result<TransferHandle>;
-    fn comm(&self) -> &dyn Collectives;                            // for TP/EP orchestration where needed
-}
-```
-
-**Why this boundary works for both worlds:**
-
-- GPU wants: ragged batch, block tables, CUDA-graph-friendly buckets. ✔
-- TPU wants: static-shape buckets, ragged paged attention, one compiled executable per bucket. ✔
-- Both want device-side sampling and device-side future-token resolution to avoid host round-trips. ✔
-
-**Shape buckets** are the shared concept. On GPU a bucket selects a captured CUDA graph (decode) or piecewise graph (prefill); on TPU it selects a precompiled XLA executable. The core asks `capabilities()` for the bucket grid and pads plans accordingly.
-
-### 5.5 Model definition: a macro-op IR (not a tensor compiler)
-
-Building a general graph compiler is how inference-engine projects die. Instead:
-
-- A model is Rust code that constructs a **`ModelGraph`** at load time out of \~25 *macro-ops*: `Embed`, `RmsNorm`, `LayerNorm`, `QkvProj`, `Rope(variant)`, `Attention(variant: Full | Sliding | MLA | Linear)`, `OProj`, `GatedMlp`, `MoeRouter`, `MoeExperts`, `SharedExpert`, `LmHead`, `Sample`, `AllReduce`, `AllToAll`, `LoraDelta`, …
-- Each op has a declared **sharding spec** (replicated / column / row / expert / data-parallel-attention) so TP/EP/DP are expressed once.
-- **GPU backend** *interprets* the graph: each macro-op maps to one or a few fused kernels. Capture the whole step in a CUDA graph per bucket.
-- **TPU backend** *lowers* the entire graph to StableHLO (with Pallas custom calls for attention/MoE), compiles via PJRT, and caches executables.
-- **Escape hatch:** a `CustomOp` registry so a new architecture can ship before every backend supports it.
-
-This gives roughly 80% of models (Llama/Qwen/Mistral/Gemma-style dense, Mixtral/Qwen-MoE/DeepSeek-style MoE+MLA) with a small op set. New architectures usually mean one new attention variant or router, not a new compiler.
-
-**Weights:** `safetensors` via `mmap` → pinned staging → device, with parallel shard loading. Quantized checkpoint handling (AWQ/GPTQ/FP8/NVFP4/MXFP4 layouts) lives in a `WeightTransform` layer that is backend-aware but shared. Optional GPUDirect Storage later.
-
-### 5.6 CUDA backend
-
-**Foundation crates:** `cudarc` (driver API, NVRTC, cuBLAS/cuBLASLt, NCCL bindings) ⚠️ verify maturity for your needs; `half`; custom FFI crate for kernel libraries.
-
-**Kernel sourcing strategy (the pragmatic part):**
-
-| Need | Phase 1 (reuse) | Phase 2+ (own, where profiling justifies) |
 | --- | --- | --- |
-| Attention (prefill/decode/ragged/paged) | FlashInfer, built AOT into cubins | Own persistent/split-KV decode kernel; cascade attention |
-| MLA attention | FlashInfer / FlashMLA-class kernels | Own, if gaps |
-| Dense GEMM | cuBLASLt, CUTLASS | CUTLASS-based fused epilogues |
-| FP8 / FP4 GEMM | CUTLASS, DeepGEMM-class | Autotuned per-shape tables |
-| MoE (grouped GEMM, routing, permute) | CUTLASS grouped GEMM + custom routing | Fused MoE (Triton-AOT or CUDA), DeepEP-style dispatch |
-| Norm / RoPE / activation / sampling | Small custom CUDA kernels (easy, high fusion value) | Further fusion |
-| All-reduce | NCCL | Custom one-shot/two-shot NVLink all-reduce |
 
-**Kernel packaging:** `build.rs` drives `nvcc`/Triton AOT to produce fatbins for the target SM archs (sm_80, sm_90, sm_100/103, sm_120 as needed); loaded at runtime through the driver API. Feature-gate per arch to keep binaries sane.
+| Dense GEMM (BF16) | cuBLASLt | CUTLASS fused epilogues |
 
-**CUDA graphs:** captured per decode bucket at warmup; piecewise graphs for prefill (graph the dense parts, run attention eagerly or with a fixed-plan kernel). Warmup is deterministic and cached, with TRT-LLM-style discipline: no surprises at request time.
+| Paged attention (prefill + decode) | FlashInfer, if C-07 to C-09 pass | Own decode kernel |
 
-**Streams:** compute, H2D, D2H, and KV-tier-copy streams, with events for dependencies. The driver thread owns all of them.
+| Norm, RoPE, activation, sampling | Reuse where license/ABI permit; otherwise small custom kernels | Further fusion |
 
-### 5.7 TPU backend
+| KV write, host-tier copies | Small custom kernel; async copies on a dedicated stream | Batched copy kernels |
 
-TPUs are a different execution model: XLA-compiled static programs, systolic MXUs, ICI mesh collectives, Pallas/Mosaic for custom kernels. Be honest about the cost: this is the highest-risk part of the plan.
+- **Memory:** preallocate steady-state device workspace and reusable metadata buffers. Measure scheduler and executor allocations and remove the ones that matter.
 
-**Integration path:** Rust talks to TPU through the **PJRT C API** (via Rust PJRT bindings ⚠️ verify the current crate landscape, or write thin bindings against the C API). PJRT gives compile, execute, buffer management, and (on multi-chip) sharded execution.
+- **CUDA graphs:** add decode graphs after eager correctness. Bound the bucket set and measure padding waste and graph memory.
 
-**Three options for producing the XLA program:**
+- **Streams:** compute plus copy streams with explicit events; the executor owns all of them.
 
-| Option | Description | Pros | Cons |
-| --- | --- | --- | --- |
-| **A. Rust lowers macro-ops → StableHLO** | Backend builds HLO text/MLIR from `ModelGraph` | One model definition; Python-free; best long-term | Most work; need Pallas kernels as custom calls anyway |
-| **B. Offline JAX export** | Python (build-time only) defines models, exports StableHLO + Pallas kernel artifacts; Rust loads & runs | Fastest path to a working TPU backend; leverages JAX ecosystem | Models defined twice; export pipeline to maintain |
-| **C. Embed Python/JAX at runtime** | Rust shells into JAX | Easiest | Reintroduces GIL and overhead. **Reject.** |
+- **Packaging:** `atlas-cuda/build.rs` runs `nvcc` for `ATLAS_CUDA_ARCHS`; only a small C ABI header crosses into Rust (§6.2).
 
-**Recommendation:** **B for the TPU alpha** (validate the abstraction and the scheduler on real TPU hardware within weeks), **converging on A** for the model families that matter. Keep Python out of the request path in both.
+- **Distribution:** a Linux CUDA container with pinned dependencies. A Rust executable does not make CUDA, kernel libraries or driver dependencies disappear, so no fully static or universally portable binary is promised. Windows is fine for host-side work; validate CUDA work on the Linux target.
 
-**Mapping the core abstractions to TPU:**
+### 5.7 Overlap and feature composition (follow-ups, not prerequisites)
 
-- `ShapeBucket` → one precompiled executable per `(num_tokens, num_seqs, max_pages)` bucket, persisted in a compilation cache. Warmup compiles the full grid at startup (or loads from cache).
-- Attention → **ragged paged attention** (Pallas kernel). Page size is dictated by the backend through `capabilities()`, and the KV manager supports a per-backend page size.
-- Sharding → the graph's sharding specs become GSPMD/Shardy annotations; XLA inserts collectives over ICI. No hand-written NCCL equivalent.
-- No CUDA-graph analog is needed: an XLA executable is already a single launch.
-- Sampling and future-token resolution stay on-device, same as GPU.
-- MoE → grouped/ragged matmul approaches (megablox-style) ⚠️ verify the state of the art.
-- Quantization → int8 broadly, FP8 where the TPU generation supports it.
-- KV tiering and P/D over DCN use the same `KvTier` trait with a different transport.
+Each of these is a later experiment with explicit costs, not a promise that the feature is free.
 
-**What this means for the core:** nothing in `atlas-core` may assume CUDA semantics (streams, pointer arithmetic on block tables, dynamic shapes). Enforce this with a CI job that builds and runs the whole core against the mock and CPU backends.
+| Feature | Correctness contract | Performance question |
 
-### 5.8 Sampling, structured output, speculative decoding
-
-**Sampling:** on-device (temperature, top-k/p, min-p, penalties, seeded RNG per sequence, logprobs), with a fused sampling kernel on GPU.
-
-**Structured output:**
-
-- Grammar engine as a CPU worker pool. Start by integrating **llguidance** (Rust) ⚠️ evaluate vs. xgrammar FFI; compute token bitmasks asynchronously for step *N+1* while step *N* runs.
-- Bitmask is uploaded as a packed tensor and applied inside the sampling kernel.
-- Jump-forward decoding (SGLang idea): when the grammar forces a deterministic span, append it without model calls.
-
-**Speculative decoding:** the step format already supports `q_len > 1` per sequence, so speculation is a scheduler feature, not a special path.
-
-- Phase 1: n-gram / prompt-lookup (no extra model; wins on code/RAG/summarization).
-- Phase 2: EAGLE-style draft heads and MTP heads (DeepSeek/Qwen-style).
-- Phase 3: tree verification with a tree attention mask; adaptive `k` per sequence based on observed acceptance, with the *cost model* deciding when speculation pays (at large batch, speculation can hurt throughput, so the scheduler should turn it off).
-
-### 5.9 Parallelism and communication
-
-| Strategy | Use | Notes |
 | --- | --- | --- |
-| **TP** (tensor) | Dense layers, within a node | NCCL → custom all-reduce on NVLink |
-| **PP** (pipeline) | Multi-node when TP bandwidth is insufficient | Microbatching handled by scheduler |
-| **EP** (expert) | MoE | All-to-all dispatch/combine; DeepEP-style low-latency kernels later |
-| **DP-attention** | MoE/MLA models (DeepSeek style) | Attention data-parallel, experts expert-parallel; avoids KV duplication |
-| **CP** (context) | Very long context | Later |
-| **DP replicas** | Throughput scale-out | Router-level |
 
-Rules:
+| **Overlapped steps** | Device token dependencies are explicit; every submitted step retains referenced buffers and blocks until completion. Start with at most two in-flight steps and test against the serial reference. | How much unhidden host time is removed, and how much work is wasted after stop/cancel? |
 
-- Parallelism is expressed in the **graph's sharding specs** (so the TPU path reuses it).
-- A `Collectives` trait lets the core stay agnostic.
-- **EPLB** (expert-load balancing / replication of hot experts) is a Phase 3 item.
+| **Structured output** | The grammar mask reflects the entire committed prefix at sampling time. A late mask may gate the whole batch; claim per-sequence fallback only after proving that ready sequences can proceed independently. | Mask preparation/upload tails and sampling stalls under realistic schemas. |
 
-### 5.10 Disaggregation, KV transfer, and the router
+| **Prompt-lookup speculation** | Verification preserves the target sampling distribution: proposal, acceptance and correction rules, position/KV rollback and RNG behavior. Greedy agreement alone does not prove stochastic correctness. | Accepted tokens per unit device time, and goodput across load including draft and verification cost. |
 
-**Why:** prefill is compute-bound, decode is memory-bound; separating them lets each be scaled and tuned independently, and removes prefill↔decode interference. It pays off most with long prompts, strict TPOT SLOs, and large fleets, so it should *not* be the default for small deployments.
+| **Grammar + speculation** | Advance grammar state only through accepted tokens; constrain drafts and verification consistently; restore state after rejection. | Whether the combination beats the best eligible configuration without relaxing validity. |
 
-**Design:**
+| **Forced grammar spans** | Forced text skips sampling decisions, but its KV must be materialized before later generation depends on it. | Whether fewer calls outweigh processing the span and any retokenization. |
 
-- `KvTransport` trait (same family as `KvTier`): implementations for NVLink/P2P intra-node, RDMA/UCX/NIXL-style inter-node ⚠️ evaluate reuse of NIXL, TCP fallback, and DCN for TPU.
-- Layer-wise streaming of KV from prefill to decode workers, overlapped with compute.
-- Prefix-aware: decode-side radix index is consulted so already-present blocks aren't re-sent.
+Variable speculative acceptance means future positions, valid lengths and slot mappings are not known on the host. Do not overlap speculative steps until a coherent device-resolved metadata and rollback protocol exists; serialize the combination and report the cost honestly.
 
-**Router (separate Rust binary, `atlas-router`):**
+**Budget note:** Stage D’s chat guardrail (≥ 0.95× best-baseline goodput) may itself require hiding host overhead, because tuned baselines already overlap scheduling with execution. If Stage C traces show material host gaps on short chat, overlapped steps are budgeted inside Stage D (D-08).
 
-- Consumes **radix-tree summaries** exported by workers, and routes to the replica with the best expected cache hit.
-- Load model: queued tokens, KV pressure, recent TPOT.
-- SLO-aware: send tight-SLO requests to less loaded replicas.
-- Multi-tenant fairness and rate limits.
-- Pluggable discovery (Kubernetes, static, etcd).
+### 5.8 CPU reference and future accelerators
 
-### 5.11 Quantization
+- A tiny CPU/reference implementation is **optional**. It can validate operators and scheduler semantics; it is not required to run every model. Prefer external fixtures from a pinned HF reference when they are cheaper and more independent. CPU FP32 is a reference, not an infallible oracle for fused or quantized kernels.
 
-| Item | Plan |
+- The **mock executor** tests scheduling and resource-lifetime ordering. It says nothing about GPU numerics or accelerator portability.
+
+- **Future accelerators:** the only constraint today is that CUDA concerns (streams, pinning, graphs, raw pointers) stay inside the executor, behind opaque page references. No static-shape mode and no portability claims.
+
+### 5.9 Deferred components
+
+None of these get crates, reserved fields or placeholder traits until their scope decision passes (§8). Recorded here so the initial design doesn’t accidentally preclude them.
+
+| Component | Earliest trigger | Design note to keep in mind |
+
+| --- | --- | --- |
+
+| Tensor/expert/pipeline parallelism | A model that doesn’t fit one GPU is approved | Keep collectives out of engine code |
+
+| Router and prefill/decode disaggregation | Multi-replica traffic with measured interference | Needs a separate KV transport with its own failure states |
+
+| Quantization (FP8, INT4, FP4) | Demand plus hardware plus quality harness | Quantization becomes part of cache identity (§5.3) |
+
+| Multi-LoRA, multimodal | User demand | Adapter/encoder identity joins the cache key |
+
+| NVMe or remote KV tiers | Working set exceeds host DRAM on real traces | Same transfer-state contract (invariant 7) |
+
+| Learned speculation (EAGLE, MTP) | Prompt-lookup speculation proves the composition contract | Same verification semantics as §5.7 |
+
+| Structured-output engine (llguidance vs. xgrammar) | Constrained-output workload added to §7.1 | Mask timing contract in §5.7 |
+
+| Other accelerators | Community traction and a maintainer | Executor-only CUDA concerns (§5.8) |
+
+### 5.10 Observability and operations
+
+**Minimum telemetry:** admission and rejection counts, queue age, batch composition, TTFT and streaming latency, step duration, GPU gaps, repeated-prefill tokens, resident and restored KV bytes, transfer time, allocation pressure and per-class success.
+
+- `tracing` spans per request and per step; Prometheus-style metrics.
+
+- No high-cardinality tenant or request labels in public metrics.
+
+- Logs, metrics and diagnostic dumps exclude prompt and output text by default.
+
+- A redacted step flight recorder (shapes, IDs, timings of the last N steps) is dumped on error.
+
+- GPU-time attribution and a simulator are not prerequisites; add them when a decision needs them.
+
+**Failure handling**
+
+| Failure | Behavior |
+
 | --- | --- |
-| Weights | FP8 (W8A8) first; then INT4 AWQ/GPTQ (W4A16); NVFP4/MXFP4 on Blackwell; INT8 on TPU |
-| Activations | Dynamic per-token FP8 quant fused into preceding op |
-| KV cache | FP8 first; INT4/FP4 KV experimental |
-| Calibration | Out of scope for the engine; consume existing checkpoints (ModelOpt, llm-compressor, AWQ). Provide a validation harness (perplexity + task evals) |
-| Policy | Quantization is a **property of the `ModelSpec` and `CacheSpec`**, with capabilities checks. The backend refuses unsupported combos at load, not at runtime |
 
-### 5.12 Multi-LoRA and multimodal (later phases)
+| Client disconnect / cancel | Release logical ownership at once; release device resources only after in-flight steps that reference them complete |
 
-- **Multi-LoRA:** batched adapter application (Punica/S-LoRA style kernels), adapter LRU in HBM/host, scheduler awareness (batch by adapter where it helps). The `LoraDelta` macro-op and `lora` field in `StepPlan` are reserved from day one.
-- **Multimodal:** a separate **encoder stage** with its own cache (embeddings keyed by content hash), optionally disaggregated (E/P/D). The KV manager treats image tokens as ordinary tokens with special hashes for prefix caching.
+| KV exhaustion | Admission and preemption stay within fixed budgets; reject with 429 before queues grow without bound |
 
-### 5.13 Observability and cost accounting
+| Context-poisoning CUDA error | Fail outstanding requests, keep a redacted diagnostic record and restart the serving process. Never restart a thread inside a poisoned context. No silent automatic retries: they need caller-level duplicate-output handling |
 
-- `tracing` + OpenTelemetry spans per request and per step.
-- Prometheus metrics: queue depth, batch tokens, KV utilization per tier, prefix hit rate, TTFT/TPOT histograms, spec acceptance rate, graph bucket hit rate, padding waste.
-- **GPU-second attribution:** each step's measured device time is split across sequences proportional to their token share, then aggregated per request/tenant. This enables *real* cost-per-request reporting and cost-aware routing.
-- **Step flight recorder:** ring buffer of the last N `StepPlan`s and outputs, dumped on error. This makes it possible to reproduce production bugs in the simulator.
-- Chrome-trace/Perfetto export of the scheduler timeline.
+| Hung GPU work | A step watchdog treats expiry as a fatal device error |
+
+| Graceful drain | Stop admission; finish or time out outstanding requests; exit |
+
+| Health | `/health` reports process health; `/ready` requires loaded weights and completed initialization, and is false while draining |
 
 ---
 
-## 6. Repository / Crate Layout
+## 6. Repository Layout and Rust Engineering Practices
+
+This section is the reference for *how* code is written. §12 is the reference for *what* to build next. It applies from Stage C; Stages A and B need only the benchmark tooling.
+
+### 6.1 Lessons from Rust open-source projects
+
+| Project | What Atlas adopts |
+
+| --- | --- |
+
+| **rust-analyzer** | Flat `crates/` folder under a virtual root manifest; folder name = crate name; an `ARCHITECTURE.md` that lists invariants and boundaries; `cargo xtask` instead of shell scripts; one integration-test binary per crate (`tests/it/main.rs`) |
+
+| **Ruff / uv (Astral)** | `[workspace.dependencies]` and `[workspace.lints]` as the single source of truth; snapshot tests for API output; a thin binary over library code |
+
+| **tokio** | Never block the async runtime; model-check custom concurrency only if any is ever written |
+
+| **TiKV** | Failpoints (`fail` crate) for fault-injection tests such as cancellation during copy or a device error |
+
+| **candle, mistral.rs** | `build.rs` compiling CUDA sources; `half` for BF16; how existing Rust engines bind CUDA libraries. Read before choosing the binding |
+
+| **HF TGI** | axum OpenAI-compatible frontend with a validation layer and the engine behind a channel |
+
+| **Rust API Guidelines** | Naming, conversion traits, `Debug` on public types, error types |
+
+**vLLM structural pain points, and the Atlas rule for each:**
+
+| Pain point | Atlas rule |
+
+| --- | --- |
+
+| One large package where entrypoints, model code, kernels, distributed and platform code import each other freely | Enforced module and crate boundaries (§6.3); engine code can’t see CUDA types |
+
+| Behaviour spread across many environment variables and a very large CLI flag surface | One typed config tree (TOML + serde, `deny_unknown_fields`), a few CLI overrides, env vars only for logging and paths |
+
+| Platform checks scattered through model and scheduler code | CUDA concerns live only in `atlas-cuda`; supported configurations are validated at startup |
+
+| Feature combinations that silently break | Unimplemented combinations are rejected at startup; implemented ones each have a contract and test (§5.7) |
+
+| Model files mixing math, weight loading, quantization and parallelism | One architecture in plain code; weights in their own module; no parallelism yet |
+
+### 6.2 Starting layout and split triggers
+
+Stage C starts with **three crates plus `xtask`**. No empty future crates.
 
 ```
+
 atlas/
+
+├─ Cargo.toml                 # virtual manifest: members, workspace deps, lints, profiles
+
+├─ Cargo.lock                 # committed
+
+├─ rust-toolchain.toml        # pinned when Stage C starts
+
+├─ rustfmt.toml
+
+├─ clippy.toml
+
+├─ deny.toml                  # licenses, advisories, sources
+
+├─ .gitattributes             # * text=auto eol=lf
+
+├─ .cargo/config.toml         # xtask alias only
+
+├─ .config/nextest.toml       # serial test group for GPU tests
+
+├─ .github/workflows/         # host.yml (every PR), cuda.yml (device changes + nightly), perf.yml
+
+├─ ARCHITECTURE.md            # module map + §5.3 invariants + boundaries
+
+├─ CONTRIBUTING.md
+
+├─ LICENSE
+
+│
+
 ├─ crates/
-│  ├─ atlas-types/        # IDs, SamplingParams, StepPlan, BackendCaps, errors (no deps on runtime)
-│  ├─ atlas-core/         # scheduler, request state machine, KV manager, speculation controller
-│  ├─ atlas-kv/           # BlockPool, PrefixIndex (radix), tiers, eviction
-│  ├─ atlas-model/        # ModelGraph IR, macro-ops, model definitions (llama, qwen, moe, mla...)
-│  ├─ atlas-weights/      # safetensors, quant formats, WeightTransform
-│  ├─ atlas-tokenizer/    # tokenizer, chat templates, detok, tool/reasoning parsers
-│  ├─ atlas-grammar/      # structured-output integration
-│  ├─ atlas-server/       # axum/tonic frontend, OpenAI API, metrics
-│  ├─ atlas-backend/      # Backend trait + shared utilities (arenas, pinned buffers)
-│  ├─ atlas-backend-mock/ # latency-model backend for simulation/tests
-│  ├─ atlas-backend-cpu/  # slow reference backend (correctness oracle, 2nd backend validation)
-│  ├─ atlas-backend-cuda/ # cudarc, kernel FFI, graphs, NCCL
-│  ├─ atlas-backend-tpu/  # PJRT, executable cache, Pallas artifacts
-│  ├─ atlas-comm/         # Collectives, KvTransport traits + impls
-│  ├─ atlas-router/       # cluster router binary
-│  ├─ atlas-sim/          # discrete-event simulator + workload generators
-│  └─ atlas-bench/        # benchmark harness ($/Mtok under SLO)
-├─ kernels/
-│  ├─ cuda/               # custom CUDA sources, build scripts
-│  ├─ triton/             # Triton AOT sources
-│  └─ pallas/             # Pallas sources + export scripts (build-time Python)
-├─ evals/                 # parity tests vs. HF reference, quality evals
-└─ docs/                  # ADRs, design docs
+
+│  ├─ atlas/                  # engine + server binary
+
+│  │  ├─ src/
+
+│  │  │  ├─ main.rs
+
+│  │  │  ├─ config.rs          # one typed config tree, validated at startup
+
+│  │  │  ├─ server/            # axum routes, SSE, admission, tokenizer, template, detok, stop buffer
+
+│  │  │  ├─ engine/            # engine thread, request state, scheduler, reconcile
+
+│  │  │  ├─ kv/                # block pool, generation-tagged refs, prefix index, eviction, host tier
+
+│  │  │  ├─ executor.rs        # private Executor trait: CUDA adapter + test mock (not a public API)
+
+│  │  │  └─ telemetry.rs       # metrics, spans, redacted flight recorder
+
+│  │  └─ tests/it/              # host-side integration tests
+
+│  │
+
+│  ├─ atlas-cuda/             # executor + FFI; the only crate allowed to use unsafe
+
+│  │  ├─ build.rs               # nvcc for ATLAS_CUDA_ARCHS
+
+│  │  ├─ include/atlas_cuda.h   # the only ABI that crosses into Rust
+
+│  │  ├─ csrc/                  # shims over FlashInfer and small kernels
+
+│  │  ├─ third_party/           # pinned submodules
+
+│  │  ├─ src/                   # device, memory, forward pass, graphs, sampling
+
+│  │  └─ tests/it/              # GPU tests (serial group)
+
+│  │
+
+│  └─ atlas-bench/            # black-box HTTP load generator and report
+
+│     ├─ src/                   # client, trace replay, SLO accounting, cost, report
+
+│     ├─ workloads/             # frozen §7.1 trace definitions
+
+│     └─ baselines/             # pinned vLLM / SGLang launch configs
+
+│
+
+├─ xtask/                     # ci, fixtures, module-boundary checks
+
+├─ python/                    # build/test time only: reference fixtures, baseline scripts
+
+├─ testdata/                  # tiny fixtures; large artifacts fetched by hash
+
+└─ docs/                      # this document, ADRs, experiment notes with source revisions
+
 ```
 
-**Dependency rule:** `atlas-core` depends on `atlas-types`, `atlas-kv`, and the `Backend` trait only. It must never import a concrete backend or any CUDA/PJRT crate. Enforce with `cargo deny` / a CI check.
+**Split triggers** (split only when the trigger fires):
 
----
+| Split out | When |
 
-## 7. Testing, Benchmarking, and Quality
+| --- | --- |
 
-**Correctness**
+| `atlas-core` (engine + kv) | Host test or compile times hurt, or a second executor exists |
 
-- **Logit parity tests** vs. HF Transformers reference on small and mid models (tolerances per dtype; separate FP8/FP4 acceptance via task-level evals).
-- **Greedy-decode determinism** tests: batch-invariance checks (same output regardless of batch composition) where kernels permit; document where they don't.
-- **Property and fuzz tests** for `BlockPool` / `PrefixIndex` (ref-count conservation, no double-free, eviction safety). Use `proptest` and `loom` for concurrent structures.
-- **Cross-backend tests:** every model runs on `cpu` and `mock` in CI; `cuda` and `tpu` on hardware runners.
+| Shared types crate | Two crates need the same types |
 
-**Scheduler simulation (a differentiator)**
+| Simulator | H2 policy work needs repeatable experiments beyond the lookup table |
 
-- `atlas-sim` runs the real scheduler + KV manager against `atlas-backend-mock` with a *calibrated latency model* (fit from real GPU step timings by `(num_tokens, num_seqs, kv_len)`).
-- Replay production traces, sweep policies, and estimate fleet capacity *without GPUs*. This is also how you prove that policy changes help before shipping.
+| CPU reference executor | External fixtures stop being sufficient |
 
-**Benchmarks (standardized and honest)**
+| Router | A multi-replica need is approved (§8) |
 
-- Workloads: chat (short in/short out), RAG (long in/short out), code completion (high prefix reuse), agentic (multi-turn with shared prefix), long-context, reasoning (long out), structured-output.
-- Metrics: throughput, TTFT, TPOT P50/P99, **goodput under SLO**, **$/Mtok**, prefix hit rate, GPU utilization (SM active, memory BW), CPU overhead per step.
-- Baselines: vLLM, SGLang, TensorRT-LLM (and Dynamo for disaggregated) on identical hardware, versions pinned, and configs tuned fairly. Publish scripts. Credibility matters more than a single flattering number.
-
----
-
-## 8. Roadmap
-
-Timelines assume a **team of 3–4 strong engineers** (see §9). Adjust proportionally. Each phase has an **exit criterion** so you know when to move on.
-
-### Phase 0: Foundations (Weeks 0–6)
-
-- Workspace, CI, `atlas-types`, `Backend` trait draft, **mock backend + simulator skeleton**.
-- Tokenizer/chat-template/detok pipeline, safetensors loader.
-- **CPU reference backend** for a tiny Llama-architecture model (the correctness oracle *and* abstraction test #1).
-- Benchmark harness skeleton and workload generators.
-- ADRs for the key decisions in §11.
-
-**Exit:** a tiny model generates correct text end-to-end on the CPU backend through the real scheduler and API.
-
-### Phase 1: Single-GPU MVP (Months 2–4)
-
-- CUDA backend via `cudarc`: model loading, FlashInfer-based paged attention, cuBLAS GEMMs, custom norm/RoPE/sampling kernels.
-- Paged KV manager (single cache group), continuous batching + **chunked prefill**, token-budget scheduler.
-- CUDA graph capture for decode buckets.
-- OpenAI-compatible API with streaming.
-- Dense models: Llama-3-family and Qwen-family, BF16.
-- **TPU spike** (parallel, 1 engineer for 3–4 weeks): run a small dense model on a TPU via PJRT using option B (exported StableHLO + Pallas ragged paged attention) *with the same `StepPlan`*. Goal is to find abstraction leaks early.
-
-**Exit:** within a reasonable margin of vLLM on single-GPU dense-model throughput at fixed latency for chat workloads, with logit parity. `StepPlan` survives the TPU spike with at most small modifications.
-
-### Phase 2: Performance Parity (Months 4–7)
-
-- **Async/overlapped scheduling** with device-side future tokens.
-- **Prefix caching** (radix index + eviction) and cascade/shared-prefix attention.
-- FP8 weights/activations and FP8 KV.
-- TP across GPUs via NCCL; custom all-reduce as a stretch.
-- Structured output (llguidance), n-gram speculative decoding.
-- Observability + GPU-second accounting.
-- Benchmarks vs. vLLM / SGLang published, honestly.
-
-**Exit:** matching or beating vLLM/SGLang on at least the prefix-heavy and structured-output workloads; CPU overhead per step measured and low.
-
-### Phase 3: Breadth and MoE (Months 7–10)
-
-- MoE: grouped GEMM, fused routing, **EP**, DP-attention; DeepSeek-class (MLA) support; hybrid cache groups (sliding window, linear attention).
-- EAGLE/MTP speculative decoding with adaptive `k`.
-- Multi-LoRA.
-- **KV tiering** (host DRAM, then NVMe/remote).
-- `atlas-router` v1: cache-aware + load-aware routing.
-- TPU backend moves from spike to **alpha**: TP/EP via sharding specs, executable cache, a few model families.
-
-**Exit:** serves a flagship open MoE model at competitive cost; router demonstrably raises fleet-wide prefix hit rate.
-
-### Phase 4: Fleet and Disaggregation (Months 10–14)
-
-- **P/D disaggregation** with `KvTransport` (NVLink, RDMA, TCP), layer-wise streaming.
-- SLO-aware scheduler policy; autoscaling hooks and a Kubernetes operator/Helm chart.
-- Blackwell-specific paths (NVFP4/MXFP4 GEMM and KV).
-- TPU backend **beta** (A-path lowering for the main model families; multi-host).
-- Cost-aware routing across heterogeneous hardware (GPU + TPU) using the GPU-second accounting.
-
-**Exit:** a published reference deployment showing $/Mtok under SLO versus a colocated baseline.
-
-### Phase 5: Ecosystem (Months 14+)
-
-- Multimodal with encoder disaggregation; long-context (CP); more architectures; AMD/ROCm or other backends if demand exists.
-- Plugin API for models/backends/policies; stable public crates.
-- Community: contribution guides, model-porting guide ("a new model in a day").
-
-### Milestone summary
+### 6.3 Dependency and module rules
 
 ```mermaid
-gantt
-    dateFormat  YYYY-MM-DD
-    axisFormat  M%m
-    title Atlas roadmap (relative)
-    section Core
-    Phase 0 Foundations          :p0, 2026-11-01, 6w
-    Phase 1 Single-GPU MVP       :p1, after p0, 10w
-    Phase 2 Perf parity          :p2, after p1, 12w
-    Phase 3 MoE + breadth        :p3, after p2, 12w
-    Phase 4 Fleet + disagg       :p4, after p3, 16w
-    section TPU
-    TPU spike                    :t0, 2027-01-15, 4w
-    TPU alpha                    :t1, after p2, 14w
-    TPU beta                     :t2, after p3, 16w
+
+flowchart LR
+
+    atlas[atlas: engine + server] --> cuda[atlas-cuda: executor + FFI]
+
+    bench[atlas-bench: black-box HTTP]
+
+    xtask[xtask] -.checks.-> atlas
+
 ```
+
+1. Inside `atlas`, `engine/` and `kv/` never import tokio, axum or `atlas-cuda` types. `cargo xtask boundaries` checks this, so a later split stays cheap.
+
+2. `atlas-bench` has no internal dependencies; it measures Atlas, vLLM and SGLang through the same HTTP interface.
+
+3. `unsafe` is allowed only in `atlas-cuda`.
+
+4. `anyhow` is allowed only in binaries and `xtask`.
+
+### 6.4 Workspace configuration
+
+Pin the toolchain and exact tested dependency versions when Stage C starts, not in this document. The shape is what matters here.
+
+**Root `Cargo.toml`**
+
+```toml
+
+[workspace]
+
+resolver = “3”
+
+members = [”crates/*”, “xtask”]
+
+[workspace.package]
+
+edition = “2024”
+
+license = “Apache-2.0”
+
+publish = false
+
+[workspace.dependencies]
+
+atlas-cuda = { path = “crates/atlas-cuda” }
+
+# external crates: exact tested versions, added as each is first used
+
+[workspace.lints.rust]
+
+unsafe_code = “deny”            # atlas-cuda opts out with #![allow(unsafe_code)] in lib.rs
+
+unsafe_op_in_unsafe_fn = “deny”
+
+missing_debug_implementations = “warn”
+
+unreachable_pub = “warn”
+
+[workspace.lints.clippy]
+
+all = { level = “warn”, priority = -1 }
+
+undocumented_unsafe_blocks = “deny”
+
+dbg_macro = “deny”
+
+await_holding_lock = “deny”
+
+unwrap_used = “warn”
+
+print_stdout = “warn”
+
+cast_possible_truncation = “warn”
+
+[profile.dev.package.”*”]
+
+opt-level = 2                   # keeps tokenizer and loader dependencies fast in tests
+
+[profile.release]
+
+debug = “line-tables-only”      # usable profiles and Nsight stacks
+
+lto = “thin”
+
+[profile.profiling]
+
+inherits = “release”
+
+debug = true
+
+```
+
+CI runs clippy with `-D warnings`, so every `warn` fails CI without blocking local iteration.
+
+**Member `Cargo.toml`** (every crate):
+
+```toml
+
+[package]
+
+name = “atlas”
+
+version = “0.1.0”
+
+edition.workspace = true
+
+license.workspace = true
+
+publish.workspace = true
+
+[dependencies]
+
+atlas-cuda.workspace = true
+
+# each external dependency: `<name>.workspace = true`
+
+[lints]
+
+workspace = true
+
+```
+
+**Other root files**
+
+| File | Contents |
+
+| --- | --- |
+
+| `rust-toolchain.toml` | `channel` = current stable at Stage C; components `rustfmt`, `clippy`. Bump in its own PR |
+
+| `rustfmt.toml` | Stable options only: `edition = “2024”`, `max_width = 100`, `use_field_init_shorthand = true`, `newline_style = “Unix”` |
+
+| `clippy.toml` | `allow-unwrap-in-tests`, `allow-expect-in-tests`, `allow-dbg-in-tests` = true |
+
+| `deny.toml` | Permissive license allow-list; deny unknown registries and git sources; deny `openssl` (use rustls); record any NVIDIA redistribution decision |
+
+| `.config/nextest.toml` | `ci` profile with JUnit output; `gpu` test group with `max-threads = 1` for `package(atlas-cuda)` |
+
+| `.cargo/config.toml` | `[alias] xtask = “run --package xtask --”` |
+
+| `.gitattributes` | `* text=auto eol=lf` |
+
+### 6.5 Library candidates (verify before use)
+
+| Area | Candidates | Check before adopting |
+
+| --- | --- | --- |
+
+| HTTP and streaming | `tokio`, `axum`, `tower-http` | SSE flushing; slow-client handling |
+
+| Engine channels | `crossbeam-channel`, `tokio::sync::mpsc` | Bounded on every edge; the engine never awaits |
+
+| Tokenizer and template | `tokenizers`, `minijinja` (+ Python-compat helpers) | Exact parity with the reference chat template |
+
+| Weights | `safetensors`, `memmap2` | Hash verification; load time |
+
+| CUDA binding | `cudarc`, or a hand-written driver FFI | Coverage of the needed APIs; graph capture; license |
+
+| Numerics | `half`, `bytemuck` | BF16 layout matches the kernels |
+
+| Prefix identity | Full identity comparison, or a keyed cryptographic hash such as `blake3` | §5.3: a fast noncryptographic hash is only an index |
+
+| Errors | `thiserror` in libraries; `anyhow` only in binaries and `xtask` | One error enum per module boundary |
+
+| Config and CLI | `serde` + `toml`, `clap` | `deny_unknown_fields`; validation at startup |
+
+| Telemetry | `tracing`, `metrics` + a Prometheus exporter | Low-cardinality labels; no prompt text |
+
+| Testing | `cargo-nextest`, `proptest`, `insta`, `fail` | Model-based KV tests; failpoints for lifetimes |
+
+| Bench client | `reqwest` (rustls), `hdrhistogram` | Event timestamps exactly as §7.2 defines them |
+
+### 6.6 Coding conventions
+
+- **Errors:** libraries return typed errors (`thiserror`); no panics on recoverable paths; `expect(”invariant: ...”)` states the invariant. An executor error that may have poisoned the context is fatal for the process (§5.10).
+
+- **Handles:** block and request references are newtypes carrying a generation (for example `BlockRef { id: u32, generation: u32 }`), per invariant 3. Never pass raw integer IDs across modules.
+
+- **Ownership:** the engine thread owns request and KV metadata; other threads talk to it through bounded channels. No `Arc<Mutex<Scheduler>>`. Never block a tokio worker.
+
+- **Unsafe:** only in `atlas-cuda`. Every block has a `// SAFETY:` comment (enforced by clippy). Every device resource is an RAII type. Raw pointers never leave the crate.
+
+- **Allocation:** measure scheduler and executor allocations and preallocate the ones that matter. No blanket zero-allocation rule.
+
+- **Reproducibility:** inject the clock and a seeded RNG into the engine so host tests are repeatable. This is a testing aid, not a claim of deterministic GPU execution.
+
+- **Config:** one typed tree with defaults, validated at startup and dumped (redacted) in diagnostics. Environment variables only for logging and paths.
+
+- **Privacy:** logs, metrics and diagnostic dumps exclude prompt and output text by default.
+
+- **Visibility:** default to `pub(crate)`; `unreachable_pub` keeps the surface honest. `ARCHITECTURE.md` lists invariants; a PR that changes one updates it.
+
+- **Tests:** the cheapest layer that establishes the property (§7.5).
+
+### 6.7 Developer tooling
+
+| Tool | Purpose | When |
+
+| --- | --- | --- |
+
+| `cargo-nextest` | Test runner with a serial GPU group | Always |
+
+| `cargo-deny` | Licenses, advisories, sources | Every PR |
+
+| `cargo-insta` | Review snapshot changes | When API output changes |
+
+| `bacon` | Watch mode for check/clippy/test | Local dev |
+
+| `samply` | CPU profiling of engine and server | Perf work |
+
+| Nsight Systems / Nsight Compute | GPU timelines and kernel analysis | Stage A diagnostics, perf work |
+
+| `compute-sanitizer` | CUDA memory errors and races | Executor/kernel changes |
+
+| Fuzzing, Miri, `loom` | Parser fuzzing; UB checks; concurrency model checking | Only where the implemented risk warrants it |
+
+### 6.8 CI pipeline
+
+| Job | Trigger | Contents | Blocks merge |
+
+| --- | --- | --- | --- |
+
+| Host checks | Every PR | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, nextest host tests, `cargo deny check`, `cargo xtask boundaries`, benchmark-definition tests, reference fixtures | Yes |
+
+| CUDA validation | PRs touching device execution, lifetimes or numerics; nightly | CUDA build, eager-vs-graph tests, compute-sanitizer, logit fixtures | Yes, for those PRs |
+
+| Performance | Hot-path PRs; weekly | Repeatable comparison with a statistical threshold set from measured runner variance (no universal 3% rule) | Yes, for hot-path PRs |
+
+`cargo xtask ci` runs the host checks locally.
+
+### 6.9 Platform notes
+
+- **Linux is the CUDA validation target.** Headline benchmarks run only on the recorded H100 configuration.
+
+- **Windows** works for host-side code (server, engine, kv, bench). For CUDA work use WSL2 or a Linux box. Commit `.gitattributes` with `eol=lf`.
+
+- **No CUDA toolkit?** Host CI builds and tests everything except `atlas-cuda` (the engine uses the mock executor).
+
+- **Archs:** `ATLAS_CUDA_ARCHS` (e.g. `”89;90”`) controls `nvcc` targets. Building only the local arch keeps kernel builds fast; the release container covers sm_90.
+
+- **Artifacts:** some networks block model hubs. Download and stage the checkpoint and baseline images on the GPU host, and verify hashes against the Stage A manifest.
 
 ---
 
-## 9. Team and Resourcing
+## 7. Benchmark Contract and Verification
 
-Suggested starting team and the skills each role must cover:
+### 7.1 Workloads
 
-| Role | Focus |
+| Workload | Purpose | Provisional latency targets (P99) |
+
+| --- | --- | --- |
+
+| **Multi-turn tool-use replay** (primary) | Immutable system prefix, growing histories, tool results and realistic revisit intervals; working-set sweeps below and above available HBM KV capacity | TTFT ≤ 1 s; mean TPOT ≤ 50 ms; ITL ≤ 100 ms |
+
+| **Short chat** (guardrail) | Queueing and low-reuse traffic | TTFT ≤ 500 ms; mean TPOT ≤ 30 ms; ITL ≤ 100 ms |
+
+| **Long-input, short-output RAG** (guardrail) | Prefill-heavy traffic | TTFT ≤ 2 s; ITL ≤ 100 ms |
+
+These are starting targets, not measured feasible limits. Before evaluating the candidate, freeze exact token-length distributions, session count, reuse distribution, tenant mix, seeds and arrival rates. Include a **low-reuse** and a **cache-thrashing** variant; never evaluate only favorable shared prefixes.
+
+- **Causal sessions:** a later turn cannot arrive before its required earlier result plus recorded think/tool time.
+
+- **Open-loop session arrivals,** so overload isn’t hidden by clients waiting for service. Also publish fixed absolute-timestamp replay for controlled comparisons, clearly labeled as different semantics.
+
+- Tool-result payloads and tool delays are identical across engines.
+
+- **Controlled capacity runs** freeze continuation lengths and request semantics consistently; label any EOS suppression as synthetic. Run natural-EOS and task-quality tests separately.
+
+### 7.2 Measurement definitions
+
+- **TTFT:** client request submission to the first nonempty generated-text event, including queueing and prompt processing. Report instrumented server phases separately for diagnosis.
+
+- **ITL:** interval between successive emitted tokens. If SSE events carry several tokens and token timestamps are unavailable, report inter-event latency and chunk sizes explicitly; never present inferred per-token timestamps as measurements.
+
+- **Mean TPOT:** (last token time − first token time) / (output tokens − 1); undefined for outputs shorter than two tokens. Report eligibility counts. Add a token-timestamp-capable track if the public API can’t measure TPOT/ITL faithfully.
+
+- **Request goodput:** successful, quality-valid requests that meet TTFT, mean TPOT where applicable, and a frozen per-request maximum streaming-gap deadline, divided by measurement time. Also report aggregate P99 TTFT/TPOT and ITL (or labeled event-latency) gates; they are different statistics.
+
+- **Sustainable goodput:** the highest measured stable rate that passes the aggregate latency gates and the frozen success/coverage requirements. Queues must not grow during the window.
+
+- Rejections, timeouts, malformed outputs and failures stay in the offered-load denominator. Report success fraction and goodput by tenant and prompt-length class.
+
+Freeze the allowed rejection/failure fraction and the minimum successful coverage per class. Apply identical client deadlines, timeout handling and percentile computation to every engine, and explain censored failures instead of dropping them from latency charts.
+
+### 7.3 Comparison rules
+
+- Compare against the best eligible tuned vLLM and SGLang results with identical model artifacts, dtype, sampling semantics, resource limits, isolation scope and workload. TensorRT-LLM is an optional extra baseline.
+
+- Pin versions; publish defaults and tuned configurations, including relevant offload modes.
+
+- Use the same documented tuning budget per engine. **Tune on separate traces; evaluate on held-out traces.**
+
+- Report cold-cache and warm-cache results separately, including warmup and host residency. Warm runs use an identical warmup trace, never an engine-specific cache preload.
+
+- At least three independent runs per point, more if variance could reverse the conclusion. Publish raw client events, run duration, confidence intervals, resource telemetry, scripts and known limitations.
+
+- Collect profiler traces separately from headline runs.
+
+- Report cost (§1.2), cost per successful request, offered and completed requests/sec, input/output tokens/sec, and HBM/host occupancy.
+
+### 7.4 Guardrails
+
+- ≥ 0.95× best-baseline sustainable goodput on chat and RAG.
+
+- No quality degradation outside frozen numerical and task tolerances.
+
+- No starvation or isolation violations. Before testing Atlas, fix a minimum per-class service requirement and a maximum wait bound, so aggregate wins can’t hide sacrificed long-context requests.
+
+### 7.5 Verification layers
+
+Use the cheapest layer that establishes the property:
+
+- **Host unit and property tests:** scheduler transitions, accounting, prefix identity, retention and eviction. Model-based KV tests against a naive implementation. The mock executor tests scheduling and lifetime ordering, not GPU numerics.
+
+- **Reference fixtures:** logits and operator outputs from a pinned HF/reference run, with documented dtype-dependent absolute/relative tolerances.
+
+- **CUDA tests:** eager versus graph execution, varying batch and context sizes, page boundaries, cancellation and immediate reuse; compute-sanitizer for executor and kernel changes.
+
+- **End-to-end checks:** streaming, stop semantics, quality and validity, resource bounds, latency and fairness. For stochastic sampling, test distributions and feature equivalence; don’t require identical sampled strings across implementations.
+
+- **Feature matrix:** only implemented combinations, plus adverse interleavings. Host or mock success never replaces CUDA event-ordering tests.
+
+---
+
+## 8. Roadmap: Evidence-Gated Stages
+
+Dates are planning envelopes for a small experienced team, not delivery promises. Assign an owner, GPU access and a capped spend before each stage, and record a calendar/spend limit at kickoff. Extensions require a new decision, not automatic continuation. The task-by-task list is in §12.
+
+| Stage | Work | Exit and decision |
+
+| --- | --- | --- |
+
+| **A: characterize** (2–3 weeks) | Freeze artifacts and trace format; tune baselines; collect load curves, cache/offload behavior and critical-path traces. | Published bottleneck report with an H1 upper bound and one intervention worth testing. If absent, stop. |
+
+| **B: intervene** (2–4 weeks) | Prototype one policy in an existing engine where feasible; compare with tuned baseline policies on held-out traces. | Repeatable useful effect with explanation and ablation. If upstream integration solves the problem, contribute it; continue to C only with recorded build intent (§12.8). |
+
+| **C: vertical slice** (6–10 weeks) | Minimal Rust serving path: one dense model, BF16, paged attention, continuous batching, chunked prefill, serial execution. | Correct logits and streaming, bounded memory, measured kernel-integration feasibility and ≥ 0.90× best-baseline chat goodput. Revise or stop if the gap consumes the intervention’s upside. |
+
+| **D: prove the thesis** (6–10 weeks) | Add the evidenced residency/scheduling intervention; optimize only measured bottlenecks (overlap if host gaps threaten the chat guardrail, §5.7). | ≥ 1.30× primary sustainable goodput within the §7.4 guardrails, with raw results and ablations. Otherwise publish the negative result and stop, or submit a separately reviewed pivot. |
+
+**Learning-track option:** if build intent is recorded at kickoff with its own budget, the Stage C setup and CUDA-feasibility items (C-01 to C-09) may run in parallel with Stages A and B. They don’t depend on the thesis, and they de-risk the integration early. Nothing past C-09 starts before Decision B.
+
+```mermaid
+
+gantt
+
+    dateFormat  YYYY-MM-DD
+
+    axisFormat  %b
+
+    title Atlas stages (planning envelopes)
+
+    section Evidence
+
+    A Characterize baselines       :a, 2026-11-02, 3w
+
+    Decision A                     :milestone, ma, after a, 0d
+
+    B Intervene in existing engine :b, after a, 4w
+
+    Decision B + build intent      :milestone, mb, after b, 0d
+
+    section Atlas
+
+    C Vertical slice               :c, after b, 10w
+
+    Decision C                     :milestone, mc, after c, 0d
+
+    D Prove the thesis             :d, after c, 10w
+
+    Decision D                     :milestone, md, after d, 0d
+
+```
+
+**After Stage D, no breadth phase is preapproved.** Each item below needs user demand, hardware access, a measured bottleneck and a separate scope decision:
+
+| Option | Trigger |
+
 | --- | --- |
-| **Runtime/scheduler lead** | Async Rust, scheduler, KV manager, simulator, correctness of concurrency |
-| **GPU kernels/perf engineer** | CUDA/CUTLASS/Triton, profiling (Nsight), FlashInfer integration, quantization kernels |
-| **Distributed systems engineer** | NCCL/EP/PD transfer, router, K8s, observability |
-| **TPU/XLA engineer** (from Month 3) | PJRT, StableHLO, Pallas, sharding |
 
-**Hardware budget matters.** Plan for: dev boxes with 1–2 consumer/datacenter GPUs, a rented 8×H100/H200-class node for TP/EP work, Blackwell access by Phase 4, and TPU access (e.g., via cloud) from Month 3. CI should have at least one real-GPU runner for nightly parity and perf regression tests.
+| Structured output | A constrained-output workload is added to §7.1 |
+
+| Prompt-lookup speculation | Traces show decode-bound headroom at the target load |
+
+| Quantization (FP8, INT4) | Demand plus a quality harness; consumer-GPU users asking |
+
+| Tensor parallelism, MoE | An approved model that doesn’t fit one GPU |
+
+| Router, P/D disaggregation | Multi-replica traffic with measured interference |
+
+| NVMe/remote KV tiers | Working set exceeds host DRAM on real traces |
+
+| Other accelerators | Community traction and a maintainer |
+
+---
+
+## 9. Team, Budget and Limits
+
+| Role | Stages | Focus |
+
+| --- | --- | --- |
+
+| **Experiment owner / benchmark lead** | A–D | Traces, benchmark client, baseline tuning, reports, stage decisions |
+
+| **Runtime engineer** | (B), C–D | Engine, scheduler, KV invariants, server, host tier |
+
+| **GPU integration engineer** | C–D | CUDA binding, FlashInfer integration, CUDA graphs, sanitizer and profiling |
+
+One person may hold several roles, but every stage has a named owner.
+
+**Hardware and budget:**
+
+- One recorded H100 80 GB configuration for every headline run; never mix configurations.
+
+- A cheaper development GPU for integration work; final numbers only on the recorded configuration.
+
+- A Linux host with enough RAM for the host-tier working-set sweep (§1.3).
+
+- A per-stage spend cap and calendar limit recorded at kickoff. For an open-source project, ask GPU clouds for sponsored credits early.
 
 ---
 
 ## 10. Risks and Mitigations
 
 | Risk | Likelihood / Impact | Mitigation |
+
 | --- | --- | --- |
-| **Scope explosion** (trying to match vLLM's 100+ models) | High / High | Support a *small* set (3–5 families) very well; make model porting easy rather than broad |
-| **Kernel gap vs. TRT-LLM/FlashInfer** | Medium / High | Reuse existing kernels in Phase 1–2; invest in own kernels only where profiling proves a gap |
-| **Rust-CUDA ecosystem immaturity** | Medium / Medium | Treat Rust as the orchestrator; kernels via FFI/cubins; contribute upstream to `cudarc` where needed |
-| **TPU abstraction leaks** | High / High | CPU backend in Phase 0, TPU spike in Phase 1; weekly review of "does the core know about CUDA?" |
-| **TPU compile times and static-shape limits** | Medium / Medium | Bucketing + persistent compile cache; limit bucket grid; accept some padding waste |
-| **Moving target** (new model archs, attention variants, quant formats every month) | High / Medium | Macro-op IR with `CustomOp` escape hatch; stay close to upstream research; modular `CacheSpec` |
-| **Differentiation unclear** | Medium / High | Commit to the wedge: portability + cost-aware scheduling/routing + tiered KV + simulator. Measure and publish $/Mtok under SLO |
-| **Async scheduling correctness bugs** (reconciliation, stop handling) | Medium / High | Simulator + property tests + flight recorder; ship behind a flag, then default |
-| **Benchmark credibility** | Medium / Medium | Publish scripts, pin versions, tune baselines fairly |
-| **Funding / adoption** | Medium / High | Early design partners with real workloads (prefix-heavy agent/RAG traffic benefits first) |
+
+| **Baselines already close the gap** (H1 fails) | Medium / High | Stage A stops early and publishes; no code written |
+
+| **Upstream absorbs the policy** | High / Medium | Compare Atlas against baselines that include the contributed policy; build intent recorded explicitly |
+
+| **Effect too small for the integration cost** | Medium / High | Upper bound before building (§1.1); Stage C gate at ≥ 0.90× chat goodput |
+
+| **Rust ↔ FlashInfer/CUDA integration harder than expected** | Medium / High | C-05 to C-09 first, with a revise-or-stop gate; study mistral.rs and candle |
+
+| **KV lifetime or aliasing bugs** | Medium / High | §5.3 invariants, generation-tagged references, model-based tests, compute-sanitizer |
+
+| **Invalid measurement** (SSE chunking, closed-loop clients hiding overload, unfair tuning) | Medium / High | §7 contract: open-loop arrivals, held-out traces, equal tuning budget, raw data published |
+
+| **Feature-composition bugs** | Medium / High | §5.7 contracts; serialize when unsure; test only implemented combinations |
+
+| **Residual timing channels** | Medium / Medium | Tenant namespaces plus documented limits; hard isolation out of scope |
+
+| **Scope creep** | High / High | Deferred list (§1.5, §5.9); every breadth item needs a separate decision |
+
+| **Baselines move fast** | High / Medium | Pin and re-run per release; win on a measured mechanism, not a kernel upstream can copy |
+
+| **Artifact access** (model license, blocked hubs) | Medium / Medium | A-01 manifest; stage artifacts on the GPU host; verify hashes |
+
+| **Spend or calendar overrun** | Medium / Medium | Per-stage caps; extensions need a new decision |
 
 ---
 
-## 11. Key Decisions (ADRs to Write in Phase 0)
+## 11. Key Decisions (ADRs)
 
-| # | Decision | Recommendation | Revisit when |
+| # | Decision | Recommendation | When to write / revisit |
+
 | --- | --- | --- | --- |
-| 1 | Hardware abstraction level | `StepPlan` + `Backend` trait, ragged-first | TPU spike results |
-| 2 | Model IR | Macro-op graph with sharding specs; no general tensor compiler | If >30% of new models need `CustomOp` |
-| 3 | Process model | Single process, thread per device; optional process-per-device | Fault-isolation incidents |
-| 4 | Attention kernels | FlashInfer (AOT) first | Profiling shows >10% gap in key workloads |
-| 5 | GPU binding | `cudarc` + FFI to C++ kernels | If gaps block progress (consider thin bespoke bindings) |
-| 6 | TPU path | Option B (JAX export) → A (Rust lowering) | After TPU beta |
-| 7 | Prefix cache structure | Block-granular radix tree with hash-chained keys | Hybrid models complicate hashing |
-| 8 | Async scheduling | Device-side future tokens + reconcile | If reconciliation bugs persist |
-| 9 | Grammar engine | llguidance (Rust) vs. xgrammar FFI | Benchmark mask-compute latency |
-| 10 | Communication | NCCL first; custom all-reduce and NVSHMEM-class later | EP latency profiling |
-| 11 | KV transfer | Own `KvTransport` trait; evaluate wrapping NIXL | Before Phase 4 |
-| 12 | License | Apache-2.0 (compatible with the ecosystem you'll link to) | Before first public commit |
 
-**License hygiene:** reading papers and public design docs is fine. If you want the "not copying" principle to be auditable, keep implementation notes in `docs/` citing the *papers/ideas* you drew from, and review any copied-in snippets for license compatibility. Linking Apache-2.0 / BSD libraries (FlashInfer, CUTLASS, NCCL-as-binary, etc.) is normal, but ⚠️ verify each license and any NVIDIA redistribution terms for your packaging.
+| 1 | Execution boundary | Submit, poll, reconcile; opaque generation-tagged page references; private trait | Freeze after C-08; revisit when overlap or a second executor arrives |
+
+| 2 | Model code | Ordinary code for one architecture; no IR | When a second architecture is approved |
+
+| 3 | Process model | Single process, single GPU; restart the process on a poisoned context | When multi-GPU is approved |
+
+| 4 | Attention library | FlashInfer, if C-07 to C-09 pass | Integration infeasible, or a profiling gap |
+
+| 5 | CUDA binding | `cudarc` or hand-written driver FFI, decided by C-06 | Missing API coverage |
+
+| 6 | Prefix identity | Tenant + model revision + attention config + KV dtype/layout + tokens; hash as index plus verification, or a justified keyed cryptographic hash | Collision analysis or measured overhead |
+
+| 7 | Residency policy | Measured restore-versus-recompute table; restore full ranges before execution | Traces show useful prefetch |
+
+| 8 | Overlap | Serial first; at most two in flight once lifetime contracts are tested | Host gaps measured (D-08) |
+
+| 9 | License | Apache-2.0; model license verified | Before the first public commit |
+
+| 10 | Tenant sharing scope | Tenant-scoped default; cross-tenant opt-in; timing-channel limits documented | Never relaxed silently |
+
+| 11 | Benchmark methodology | The §7 contract | Each baseline release |
+
+| 12 | Build intent | Recorded before Stage C, with owner and maintainer | After Decision B |
+
+**License hygiene:** reading papers and public design docs is fine. Keep implementation notes in `docs/` citing the papers and ideas used, with exact source revisions. Verify the model license (Llama 3.1 community license), library licenses (FlashInfer, CUTLASS) and NVIDIA redistribution terms before any release.
 
 ---
 
-## 12. First 30 Days: A Concrete Checklist
+## 12. Build Checklist
 
-1. Create the workspace and CI (fmt, clippy, `cargo deny`, layering check).
-2. Write `atlas-types`: `StepPlan`, `ShapeBucket`, `BackendCaps`, `CacheSpec`, request/sequence IDs.
-3. Implement `BlockPool` + `PrefixIndex` with property tests (this is self-contained and valuable immediately).
-4. Implement the scheduler against the mock backend; drive it from `atlas-sim` with synthetic workloads.
-5. Tokenizer + chat template + detok pipeline; OpenAI-style streaming endpoint against the mock.
-6. CPU reference backend for a tiny Llama-architecture model; parity check against HF.
-7. Benchmark harness that outputs goodput under SLO and $/Mtok (given a $/GPU-hr input).
-8. Write ADRs 1–3 and 12.
-9. Rent a GPU box and start the CUDA backend: weight load → one forward pass → logit parity.
-10. Decide on early design partners and the first target workload (recommendation: prefix-heavy agentic/RAG chat on a 8B–32B dense model, then one MoE).
+### 12.0 How to use this checklist
+
+- Work top to bottom inside a stage. Each item is one PR or one experiment note.
+
+- **Done when** is the acceptance test. Don’t tick an item until it passes.
+
+- Every code item also meets the Definition of Done (§12.7). Use the feature-start routine (§12.6) each time.
+
+- A stage starts only after the previous decision in §12.8 is recorded.
+
+### 12.1 Stage A: characterize (no Atlas code)
+
+- [ ] **A-01** Artifact manifest: checkpoint revision and hashes, tokenizer/template, baseline engine versions and images, full hardware record (§1.5). *Done when:* the manifest is committed and every run references it.
+
+- [ ] **A-02** Trace generator: causal sessions, open-loop session arrivals, absolute-timestamp replay mode, identical tool payloads and delays (§7.1). *Done when:* tests prove causality and the same seed gives the same trace.
+
+- [ ] **A-03** Workload variants: primary, low-reuse, cache-thrashing, and a working-set sweep below and above HBM KV capacity; separate tuning and held-out traces.
+
+- [ ] **A-04** Benchmark client (`atlas-bench`): TTFT, inter-event latency with chunk sizes, mean-TPOT eligibility, per-request streaming-gap deadline; rejections and timeouts stay in the denominator (§7.2). *Done when:* unit tests over recorded SSE fixtures pass.
+
+- [ ] **A-05** Quality and validity checks: natural-EOS task evaluation and tool-call validity.
+
+- [ ] **A-06** Cost report: §1.2 formula, cost per successful request, GPU-only estimates labeled.
+
+- [ ] **A-07** Baseline tuning: equal documented budget for vLLM and SGLang, including their offload modes; defaults and tuned configs published.
+
+- [ ] **A-08** Load curves: sustainable goodput per workload, at least three runs per point, confidence intervals.
+
+- [ ] **A-09** Diagnostic runs (separate from headline runs): repeated-prefill tokens, restored bytes, reuse distance, queue age, GPU timelines, host-gap fraction $f$ and its $1/(1-f)$ bound.
+
+- [ ] **A-10** Restore-versus-recompute table: copy bandwidth under concurrent compute, NUMA placement, prefill time by length. *Done when:* every §1.3 assumption has a measured replacement.
+
+- [ ] **A-11** Bottleneck report: H1 upper bound, the chosen intervention, frozen SLOs, minimum effect and guardrails. *Done when:* reviewed. Stop if no intervention is worth testing.
+
+### 12.2 Stage B: intervene in an existing engine
+
+- [ ] **B-01** Pick the host engine with the cleanest residency hook; record its revision.
+
+- [ ] **B-02** Implement the A-10 policy behind a flag.
+
+- [ ] **B-03** Evaluate on held-out traces against the tuned baseline and its offload modes, with ablations.
+
+- [ ] **B-04** Check guardrails: chat and RAG ≥ 0.95×; per-class service and wait bounds.
+
+- [ ] **B-05** Decision note: contribute upstream, proceed to Stage C (with recorded build intent), or stop.
+
+### 12.3 Stage C: vertical slice
+
+**Setup**
+
+- [ ] **C-01** Workspace per §6.2 and §6.4: three crates plus `xtask`, pinned toolchain and dependencies. *Done when:* `cargo check` and `cargo clippy -- -D warnings` pass.
+
+- [ ] **C-02** Host CI (§6.8) and `cargo xtask boundaries`. *Done when:* a deliberately failing PR is blocked.
+
+- [ ] **C-03** `ARCHITECTURE.md` (module map, §5.3 invariants, boundaries), `CONTRIBUTING.md`, PR template with “hot-path impact” and “measured impact” sections.
+
+- [ ] **C-04** ADRs 9 (license) and 12 (build intent) merged; drafts of ADRs 1 and 5.
+
+**CUDA feasibility first** (revise or stop if these fail)
+
+- [ ] **C-05** `atlas-cuda`: `build.rs` runs `nvcc` for `ATLAS_CUDA_ARCHS`; C ABI header; one trivial kernel. *Done when:* a round-trip test passes on the Linux GPU host.
+
+- [ ] **C-06** CUDA binding prototype (`cudarc` vs. hand-written FFI): context, stream, event, allocation, cuBLASLt call. *Done when:* ADR 5 is merged.
+
+- [ ] **C-07** Rust → FlashInfer paged attention (prefill and decode) through the C ABI, including metadata preparation. *Done when:* outputs match the reference fixture.
+
+- [ ] **C-08** Captured decode step with changing inputs. *Done when:* eager and graph outputs match across batch sizes and page boundaries; ADR 1 is frozen.
+
+- [ ] **C-09** Packaging check: AOT build time and size, workspace requirements, licenses. *Done when:* ADR 4 is merged, or the stack is revised.
+
+**Model and executor**
+
+- [ ] **C-10** Reference fixtures: a `python/` script produces pinned HF logits and operator outputs (tiny configs plus target-model prompts) with recorded hashes; `cargo xtask fixtures` checks them.
+
+- [ ] **C-11** Weight loading: mmap, pinned staging, device, hash verification, load-time metric.
+
+- [ ] **C-12** Ops: cuBLASLt BF16 GEMM, RMSNorm (+ residual), RoPE with Llama-3.1 scaling, SiLU-and-mul, embedding, KV write. *Done when:* each matches fixtures within frozen tolerances.
+
+- [ ] **C-13** Full forward pass for Llama-3.1-8B. *Done when:* logits are within frozen tolerances on the fixture prompts.
+
+- [ ] **C-14** Sampling: greedy, temperature, top-k/top-p, per-request seeds. *Done when:* distribution tests pass (§7.5).
+
+- [ ] **C-15** Executor memory: preallocated workspace and metadata buffers. *Done when:* a counter shows no device allocation after warmup.
+
+**Engine**
+
+- [ ] **C-16** Request state machine with cancellation. *Done when:* every legal transition is tested and illegal ones are rejected.
+
+- [ ] **C-17** Block pool with generation-tagged references, reservation versus publication, committed length. *Done when:* model-based tests cover invariants 1–5 (§5.3), including cancel-then-immediate-reuse.
+
+- [ ] **C-18** Scheduler: token budget, chunked prefill, continuous batching, FCFS, serial submit/poll/reconcile.
+
+- [ ] **C-19** Capacity plan with a safety margin. *Done when:* validated under the mixed workload (invariant 6).
+
+- [ ] **C-20** Mock executor for host tests (scheduling and lifetime ordering; no numerics).
+
+**Server**
+
+- [ ] **C-21** Streaming Chat Completions subset. *Done when:* tokenizer and template output match the reference.
+
+- [ ] **C-22** Incremental detokenization and the stop-string pending-output buffer (§5.1). *Done when:* UTF-8 boundary, disconnect and slow-client tests pass.
+
+- [ ] **C-23** Admission bounds and 429, cancellation on disconnect, drain, `/health`, `/ready`.
+
+- [ ] **C-24** Minimum telemetry (§5.10) and redacted logs and flight recorder.
+
+**Exit**
+
+- [ ] **C-25** Decode CUDA graphs with bounded buckets. *Done when:* padding waste and graph memory are measured.
+
+- [ ] **C-26** CUDA CI job (§6.8). *Done when:* compute-sanitizer is clean on executor tests.
+
+- [ ] **C-27** Chat benchmark under the §7 contract; Nsight review of the top gaps. *Done when:* ≥ 0.90× best-baseline chat goodput with bounded memory. Revise or stop otherwise.
+
+### 12.4 Stage D: prove the thesis
+
+- [ ] **D-01** Tenant-scoped prefix index with full identity (§5.3); share only full blocks or copy-on-write tails. *Done when:* identity is verified beyond the hash, and two tenants with the same prompt share nothing unless opted in.
+
+- [ ] **D-02** Bounded retention and cleanup policy.
+
+- [ ] **D-03** Bounded pinned host tier with explicit transfer states (invariant 7); NUMA placement measured.
+
+- [ ] **D-04** Restore complete ranges before execution; swap-mode preemption only if the table says it pays.
+
+- [ ] **D-05** Restore-versus-recompute policy from the Stage A/B table.
+
+- [ ] **D-06** Lifetime tests with failpoints: cancellation during copy, eviction during prefetch, stale tickets, transfer failure, cleanup after a device error.
+
+- [ ] **D-07** Telemetry: repeated-prefill tokens, restored bytes, transfer time, residency.
+
+- [ ] **D-08** If host gaps threaten the chat guardrail: overlapped steps, at most two in flight, explicit device token dependencies (§5.7). *Done when:* results match the serial reference under adverse interleavings.
+
+- [ ] **D-09** Bounded prefetch, only if traces show useful overlap; wasted-prefetch metric.
+
+- [ ] **D-10** Adaptive chunk/residency policy, only if H2 survived Stages A and B.
+
+- [ ] **D-11** Full §7 evaluation on held-out traces, cold and warm, at least three runs per point, ablations, raw data published.
+
+- [ ] **D-12** Decision: ≥ 1.30× sustainable goodput within guardrails → publish; otherwise publish the negative result and stop, or submit a reviewed pivot.
+
+### 12.5 After Stage D
+
+Each item in the §8 options table needs its own scope decision, with an owner, budget and exit criterion, before any code. For structured output and speculation, the §5.7 contracts are the starting acceptance tests.
+
+### 12.6 Starting a feature (every time)
+
+1. Find the checklist item and the section it implements; re-read that section.
+
+2. Identify the owning module (§6.2). If the work needs another module’s internals, fix the boundary first.
+
+3. New dependency? Pin it in `[workspace.dependencies]` and run `cargo deny check`.
+
+4. Write the first test at the cheapest layer (§7.5).
+
+5. Engine or executor code? Decide which buffers are reused, and add a measurement.
+
+6. Add the telemetry from §5.10 that the feature affects.
+
+7. Run `cargo xtask ci` before opening the PR.
+
+8. If a recorded decision changes, update its ADR in the same PR.
+
+### 12.7 Definition of Done (every PR)
+
+- [ ] Lives in the owning module; `cargo xtask boundaries` passes.
+
+- [ ] Tests at the cheapest sufficient layer; invariants covered by property or model-based tests.
+
+- [ ] No `unsafe` outside `atlas-cuda`; every `unsafe` block has a `// SAFETY:` comment.
+
+- [ ] Telemetry added; no prompt or output text in logs.
+
+- [ ] Config changes have defaults, validation and docs.
+
+- [ ] Device-affecting changes pass CUDA validation; hot-path changes report measured impact.
+
+- [ ] `ARCHITECTURE.md` updated if a boundary or invariant changed.
+
+- [ ] Only implemented feature combinations are accepted; others fail at startup.
+
+### 12.8 Review gate
+
+Approval is stage-specific. This version seeks **Stage A approval only**; later stages remain conditional.
+
+- [ ] Named experiment owner, GPU configuration and access, compute spend and calendar limit.
+
+- [ ] Exact checkpoint revision, tokenizer/template artifacts and license approval.
+
+- [ ] Artifact path: where the checkpoint and pinned baseline images are downloaded and staged, with hashes verified.
+
+- [ ] Trace source, length/reuse/tenant distributions, causal replay rules and held-out split.
+
+- [ ] Frozen definitions for quality, SLOs, coverage, fairness, cost and minimum useful effect.
+
+- [ ] Baseline tuning budget, supported offload configurations and reproducibility plan.
+
+- [ ] **Build intent** (ADR 12): whether Stage C proceeds after a positive upstream result, with a long-term maintainer. If yes, Atlas is compared against baselines that include any contributed policy.
+
+- [ ] Learning-track option (§8): whether C-01 to C-09 run in parallel with Stages A and B, with their own budget.
+
+- [ ] Before Stage C: a measured reason a new runtime is preferable, or the recorded build intent above.
+
+- [ ] Before overlap or tiering: tested resource-lifetime and transfer-state contracts.
+
+The open fields are intentional decision inputs, not completed evidence. Passing document checks does not establish performance, correctness or ecosystem compatibility.
 
 ---
 
 ## 13. Reading List
 
+Read current, pinned implementations alongside the papers; record exact revisions in experiment notes. This list is not a capability claim.
+
+**Core to the thesis**
+
 - *Efficient Memory Management for LLM Serving with PagedAttention* (vLLM)
-- *SGLang: Efficient Execution of Structured Language Model Programs* (RadixAttention)
+
+- *SGLang: Efficient Execution of Structured Language Model Programs* (RadixAttention) and SGLang’s overlap scheduler
+
 - *Sarathi-Serve* (stall-free chunked prefill)
-- *DistServe* and *Splitwise* (P/D disaggregation)
-- *Mooncake* (KV-centric serving architecture)
+
+- LMCache and SGLang HiCache (KV offload and tiering)
+
 - *FlashAttention 1–3* and *FlashInfer*
-- *EAGLE / EAGLE-2/3*, *Medusa*, DeepSeek *MTP* (speculative decoding)
-- *S-LoRA* / *Punica* (multi-adapter serving)
-- *DeepSeek-V2/V3* technical reports (MLA, MoE, EP serving)
-- *xgrammar* and *llguidance* docs (structured output)
-- JAX Pallas docs and the ragged paged attention kernel; OpenXLA PJRT and StableHLO specs
-- Source-reading (for architecture, not copying): vLLM V1 engine core, SGLang scheduler/overlap loop, TensorRT-LLM executor, Dynamo, mistral.rs
+
+**Rust and CUDA integration**
+
+- mistral.rs and candle (`candle-kernels`): build.rs and kernel FFI patterns
+
+- matklad, *Large Rust Workspaces* and the *cargo xtask* pattern
+
+- rust-analyzer `ARCHITECTURE.md` (documenting invariants and boundaries)
+
+- *Rust API Guidelines*; *The Rust Performance Book*; *The Rustonomicon* (unsafe and FFI)
+
+**Future references (only when a scope decision needs them)**
+
+- *DistServe*, *Splitwise*, *Mooncake*, Dynamo/NIXL (disaggregation)
+
+- *EAGLE*, *Medusa*, DeepSeek *MTP*, speculative sampling papers (verification semantics)
+
+- llguidance and xgrammar (structured output)
+
+- *S-LoRA* / *Punica*; *DeepSeek-V2/V3* (MLA, MoE); TensorRT-LLM executor
 
 ---
 
-## Appendix A: Minimal Engine Loop (Sketch)
+## Appendix A: Engine Loop (Sketch)
 
 ```rust
-// Engine thread: overlapped scheduling with device-side future tokens.
+
+// Serial loop for the initial milestone: one step in flight.
+
 loop {
-    // 1. Drain new requests / cancels from the frontend channel.
-    admit_new_requests(&mut state, &rx_frontend);
 
-    // 2. Plan step N+1 while step N is still on device.
-    let plan = scheduler.plan(&mut state, &kv);          // token budget, policy, chunking
-    let plan = grammar.attach_masks(plan);               // async-computed bitmasks, if ready
-    let plan = spec.attach_drafts(plan);                 // n-gram / EAGLE drafts
+    admit_and_cancel(&mut state, &rx_frontend);              // bounded intake; 429 happens upstream
 
-    // 3. Submit (non-blocking). Tokens for running seqs are DeviceFuture refs.
-    let ticket = backend.submit(plan.into_step_plan(prev_ticket))?;
+    let Some(batch) = scheduler.plan(&mut state, &mut kv) else {
 
-    // 4. Collect results of step N (blocks only if the device is behind).
-    if let Some(prev) = in_flight.pop_front() {
-        let out = backend.wait(prev.ticket)?;
-        // 5. Reconcile: stop conditions, spec accept/reject, free/commit KV blocks,
-        //    discard speculative-over-planned slots, publish tokens to frontends.
-        scheduler.reconcile(&mut state, &mut kv, prev.plan, out, &tx_frontend);
-        metrics.record_step(&prev, &out);                // incl. GPU-second attribution
-    }
-    in_flight.push_back(InFlight { ticket, plan_meta });
+        wait_for_work(&rx_frontend);
+
+        continue;
+
+    };
+
+    let ticket = executor.submit(&batch)?;                    // an error here is fatal: process restart
+
+    let result = executor.wait(ticket)?;
+
+    scheduler.reconcile(&mut state, &mut kv, &batch, &result); // commit tokens and KV; publish completed blocks
+
+    output.send(&result);                                     // bounded; never blocks the engine
+
 }
+
 ```
 
-## Appendix B: Capability Negotiation Example
+The overlapped variant (D-08) keeps at most two steps in flight, makes device token dependencies explicit, retains every referenced buffer and block until its step completes, and is tested against this serial loop as the reference.
 
-```rust
-pub struct BackendCaps {
-    pub kv_page_sizes: Vec<u32>,                 // GPU: [16, 32, 64]; TPU: backend-specific
-    pub kv_dtypes: Vec<DType>,                   // BF16, FP8_E4M3, ...
-    pub weight_formats: Vec<QuantFormat>,        // FP8, AWQ-INT4, NVFP4, INT8 ...
-    pub attention_variants: Vec<AttnVariant>,    // Full, Sliding, MLA, Linear
-    pub supports_spec_tree: bool,
-    pub supports_lora: bool,
-    pub bucket_grid: BucketGrid,                 // allowed padded shapes
-    pub dynamic_shapes: bool,                    // false on TPU
-    pub device_future_tokens: bool,              // required for overlapped scheduling
-    pub collectives: CollectiveCaps,             // allreduce/all2all/p2p variants
-}
-```
+## Appendix B: Changes from v0.2
 
-The core chooses page size, bucket padding, and feature toggles *from this struct*. There is no `#[cfg(cuda)]` in `atlas-core`.
+| v0.2 | v0.3 | Why |
+
+| --- | --- | --- |
+
+| Combine every engine’s ideas; four hypotheses led by CPU overhead | One thesis (KV residency and scheduling); H3 host overhead is conditional | Amdahl: a 2% stall bounds the gain at about 1.02× |
+
+| ≥ 1.3× goodput **and** ≥ 25% lower $/Mtok | ≥ 1.30× ≈ 23.1% lower cost; 25% needs 1.333× | Arithmetic consistency |
+
+| $/Mtok from GPU $/hr and raw tokens/sec | Total infrastructure cost / successful SLO-compliant output tokens | Failures, quality and non-GPU costs count |
+
+| Rust gives determinism and a single static binary | Rust is an implementation choice; Linux CUDA container | The language doesn’t guarantee either |
+
+| `StepPlan` + `Backend` trait + 25-op IR in Phase 0 | Conceptual boundary, frozen after the vertical slice; ordinary model code | Avoid speculative APIs |
+
+| CPU backend runs every model; static-shape mock proves portability | Optional tiny reference; mock tests scheduling only | A mock can’t prove numerics or portability |
+
+| Stop strings trimmed after a one-step lag | Pending-output buffer | Delivered text can’t be trimmed |
+
+| xxh3 hash with tenant salt as cache identity | Full identity (tenant, model revision, attention config, KV dtype/layout, tokens); hash is an index | Collisions and configuration mismatches |
+
+| Tenant salt prevents timing leakage | Namespaces prevent reuse, not all timing channels | Honest isolation claim |
+
+| No KV lifetime contract | Seven invariants with required tests | Cancellation, reuse and transfer bugs |
+
+| Restart the device worker on a CUDA error | Restart the serving process; no silent retries | A poisoned context can’t be recovered in-process |
+
+| Overlap, speculation and grammar designed together for Phase 2 | Follow-up contracts; ≤ 2 in flight; spec + overlap serialized until a protocol exists | Correctness before performance |
+
+| Ten crates with speculative versions | Three crates plus split triggers; versions pinned at Stage C | No empty crates or guessed versions |
+
+| 3% perf-regression gate | Variance-based threshold | Runner noise differs |
+
+| Phases 0–3 including FP8/INT4, TP, MoE, router | Stages A–D with decisions; breadth needs separate scope decisions | Evidence gating |
+
+| Build vs. contribute not addressed | Build intent recorded explicitly (ADR 12); comparison includes any contributed policy | The open-source goal stays honest |
